@@ -29,7 +29,8 @@ fn synthesize(
 
     // 1. Check the store for a cached function
     if let Some(func) = store.get(name)? {
-        println!("  [cache] found '{name}' (calls: {})", func.call_count);
+        let verified = if func.is_verified { "verified" } else { "unverified" };
+        println!("  [cache] found '{name}' (calls: {}, {verified})", func.call_count);
 
         let module = if let Some(ref binary) = func.wasm_binary {
             runtime.load_cached(binary)?
@@ -55,11 +56,77 @@ fn synthesize(
     // 3. Store for future reuse
     store.save(name, description, signature, "wat", &wat, &bytes)?;
 
-    // 4. Execute
+    // 4. Generate and run tests
+    verify_function(store, runtime, llm, name, description, signature, &module);
+
+    // 5. Execute
     let results = runtime.call(&module, name, args)?;
     store.record_call(name)?;
     println!("  [wasm] {}", format_results(&results));
     Ok(results)
+}
+
+/// Generate test cases via LLM, run them, and mark the function as verified if all pass.
+/// Non-fatal: prints results but doesn't propagate errors.
+fn verify_function(
+    store: &FunctionStore,
+    runtime: &WasmRuntime,
+    llm: &LlmClient,
+    name: &str,
+    description: &str,
+    signature: &str,
+    module: &wasmtime::Module,
+) {
+    println!("  [test] generating test cases...");
+    let test_cases = llm.generate_tests(name, description, signature);
+    if test_cases.is_empty() {
+        println!("  [test] no test cases generated");
+        return;
+    }
+
+    let mut passed = 0;
+    let total = test_cases.len();
+
+    for tc in &test_cases {
+        // Store the test case
+        let test_id = match store.save_test(name, &tc.input, &tc.expected) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+
+        // Run it
+        match runtime.call(module, name, &tc.input) {
+            Ok(actual) => {
+                let ok = actual.len() == tc.expected.len()
+                    && actual
+                        .iter()
+                        .zip(tc.expected.iter())
+                        .all(|(a, e)| a.approx_eq(e));
+                if ok {
+                    passed += 1;
+                    let _ = store.mark_test_passed(test_id);
+                } else {
+                    println!(
+                        "  [test] FAIL: {}({}) = {} (expected {})",
+                        name,
+                        format_results(&tc.input),
+                        format_results(&actual),
+                        format_results(&tc.expected),
+                    );
+                }
+            }
+            Err(e) => {
+                println!("  [test] ERROR: {}({}) — {e}", name, format_results(&tc.input));
+            }
+        }
+    }
+
+    if passed == total {
+        let _ = store.set_verified(name, true);
+        println!("  [test] {passed}/{total} passed — verified");
+    } else {
+        println!("  [test] {passed}/{total} passed");
+    }
 }
 
 fn format_results(results: &[Value]) -> String {

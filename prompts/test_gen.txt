@@ -1,0 +1,13 @@
+Generate test cases for a function named "{name}" with signature {signature} that: {description}
+
+Return a JSON array of 3-5 test cases. Each test case has "input" and "expected" arrays.
+Values are objects with "type" and "value" fields.
+
+Example for an "add" function with signature (i32, i32) -> i32:
+[
+  {"input": [{"type": "i32", "value": 1}, {"type": "i32", "value": 2}], "expected": [{"type": "i32", "value": 3}]},
+  {"input": [{"type": "i32", "value": 0}, {"type": "i32", "value": 0}], "expected": [{"type": "i32", "value": 0}]},
+  {"input": [{"type": "i32", "value": -5}, {"type": "i32", "value": 10}], "expected": [{"type": "i32", "value": 5}]}
+]
+
+Output ONLY the JSON array. No explanation, no markdown fences.

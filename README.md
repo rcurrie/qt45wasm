@@ -13,6 +13,27 @@ A self-improving agentic loop inspired by [QT45](https://www.science.org/doi/10.
 | Enzyme          | Compiled WASM binary | Fast, deterministic, reusable computation                |
 | Eutectic ice    | SQLite               | The substrate that concentrates and preserves everything |
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│                   REPL                       │
+│  User input → Search → Plan → Execute → Out │
+└────────┬──────────┬──────────┬──────────────┘
+         │          │          │
+    ┌────▼───┐ ┌────▼───┐ ┌───▼────────┐
+    │ Search │ │  LLM   │ │  Runtime   │
+    │ (FTS5 +│ │ Client │ │ (wasmtime) │
+    │ vector)│ │        │ │            │
+    └────┬───┘ └────┬───┘ └───┬────────┘
+         │          │          │
+    ┌────▼──────────▼──────────▼───┐
+    │       FunctionStore          │
+    │   (SQLite: functions, tests, │
+    │    embeddings, agent state)  │
+    └──────────────────────────────┘
+```
+
 ## Install
 
 Requires [Rust](https://rustup.rs/) and [Ollama](https://ollama.com/).

@@ -117,6 +117,35 @@ impl LlmClient {
         unreachable!()
     }
 
+    /// Generate test cases for a function. Returns parsed TestCases.
+    /// Non-fatal: returns an empty vec on failure rather than propagating errors.
+    pub fn generate_tests(
+        &self,
+        name: &str,
+        description: &str,
+        signature: &str,
+    ) -> Vec<crate::types::TestCase> {
+        let prompt = match load_prompt("test_gen.txt") {
+            Ok(p) => p
+                .replace("{name}", name)
+                .replace("{description}", description)
+                .replace("{signature}", signature),
+            Err(_) => return Vec::new(),
+        };
+
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: prompt,
+        }];
+
+        let response = match self.chat(&messages) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        parse_test_cases(&response).unwrap_or_default()
+    }
+
     fn chat(&self, messages: &[Message]) -> Result<String> {
         let req = ChatRequest {
             model: self.model.clone(),
@@ -198,6 +227,68 @@ fn extract_wat(response: &str) -> String {
         }
         if end > start {
             return text[start..end].to_string();
+        }
+    }
+
+    text.to_string()
+}
+
+/// Parse LLM response into test cases.
+/// Expects a JSON array of objects with "input" and "expected" arrays.
+fn parse_test_cases(response: &str) -> Result<Vec<crate::types::TestCase>> {
+    let json_str = extract_json(response);
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&json_str)
+        .context("Failed to parse test cases as JSON array")?;
+
+    let mut tests = Vec::new();
+    for item in &arr {
+        let input_arr = item["input"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Test case missing 'input' array"))?;
+        let expected_arr = item["expected"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Test case missing 'expected' array"))?;
+
+        let input: Vec<crate::types::Value> = input_arr
+            .iter()
+            .map(crate::types::Value::from_json)
+            .collect::<Result<_>>()?;
+        let expected: Vec<crate::types::Value> = expected_arr
+            .iter()
+            .map(crate::types::Value::from_json)
+            .collect::<Result<_>>()?;
+
+        tests.push(crate::types::TestCase {
+            id: None,
+            input,
+            expected,
+        });
+    }
+    Ok(tests)
+}
+
+/// Extract a JSON array from an LLM response (strips markdown fences and surrounding text).
+fn extract_json(response: &str) -> String {
+    let text = response.trim();
+
+    // Strip markdown fences
+    if let Some(rest) = text.strip_prefix("```json") {
+        if let Some(code) = rest.strip_suffix("```") {
+            return code.trim().to_string();
+        }
+    }
+    if let Some(rest) = text.strip_prefix("```") {
+        if let Some(code) = rest.strip_suffix("```") {
+            return code.trim().to_string();
+        }
+    }
+
+    // Find the outermost [ ... ]
+    if let Some(start) = text.find('[') {
+        if let Some(end) = text.rfind(']') {
+            if end > start {
+                return text[start..=end].to_string();
+            }
         }
     }
 
