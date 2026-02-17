@@ -1,0 +1,4 @@
+That WAT code failed to compile with error:
+{error}
+
+Common WAT mistakes: Do NOT use (type 0 ...) or numeric indices. Use inline (func (export "name") (param i32 i32) (result i32) ...) syntax. Fix the code. Output ONLY the corrected WAT module, nothing else.

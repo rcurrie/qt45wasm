@@ -1,0 +1,3 @@
+Generate a WAT module with a function named "{name}" that: {description}
+Signature: {signature}
+Use inline types only. No (type ...) declarations. No numeric indices.
