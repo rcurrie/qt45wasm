@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use wasmtime::{Engine, Instance, Module, Store};
+use wasmtime::{Engine, Instance, Module, Store, Val};
+
+use crate::types::Value;
 
 /// WASM compilation and execution engine.
 pub struct WasmRuntime {
@@ -10,11 +12,6 @@ impl WasmRuntime {
     pub fn new() -> Result<Self> {
         let engine = Engine::default();
         Ok(Self { engine })
-    }
-
-    #[allow(dead_code)]
-    pub fn engine(&self) -> &Engine {
-        &self.engine
     }
 
     /// Compile WAT source text into a WASM module.
@@ -35,30 +32,24 @@ impl WasmRuntime {
         Ok(module)
     }
 
-    /// Execute a function by name from a module with i32 arguments.
-    /// Returns the i32 result.
-    pub fn call_i32(&self, module: &Module, func_name: &str, args: &[i32]) -> Result<i32> {
+    /// Execute a function by name with dynamic argument and return types.
+    pub fn call(&self, module: &Module, func_name: &str, args: &[Value]) -> Result<Vec<Value>> {
         let mut store = Store::new(&self.engine, ());
         let instance = Instance::new(&mut store, module, &[])?;
 
-        match args.len() {
-            0 => {
-                let func = instance.get_typed_func::<(), i32>(&mut store, func_name)?;
-                Ok(func.call(&mut store, ())?)
-            }
-            1 => {
-                let func = instance.get_typed_func::<i32, i32>(&mut store, func_name)?;
-                Ok(func.call(&mut store, args[0])?)
-            }
-            2 => {
-                let func = instance.get_typed_func::<(i32, i32), i32>(&mut store, func_name)?;
-                Ok(func.call(&mut store, (args[0], args[1]))?)
-            }
-            3 => {
-                let func = instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, func_name)?;
-                Ok(func.call(&mut store, (args[0], args[1], args[2]))?)
-            }
-            n => anyhow::bail!("Unsupported argument count: {n} (max 3 for i32 calls)"),
-        }
+        let func = instance
+            .get_func(&mut store, func_name)
+            .ok_or_else(|| anyhow::anyhow!("Function '{func_name}' not exported by module"))?;
+
+        let params: Vec<Val> = args.iter().map(|v| v.to_val()).collect();
+        let result_count = func.ty(&store).results().len();
+        let mut results = vec![Val::I32(0); result_count];
+
+        func.call(&mut store, &params, &mut results)?;
+
+        results
+            .iter()
+            .map(Value::from_val)
+            .collect()
     }
 }

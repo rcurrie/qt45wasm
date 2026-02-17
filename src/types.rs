@@ -1,51 +1,45 @@
-use serde::{Deserialize, Serialize};
+use wasmtime::Val;
 
-/// A WASM value type
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ValType {
-    I32,
-    I64,
-    F32,
-    F64,
+/// A runtime value that can be passed to/from WASM functions.
+#[derive(Debug, Clone)]
+pub enum Value {
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
 }
 
-impl std::fmt::Display for ValType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Value {
+    /// Convert to a wasmtime Val for dynamic function calls.
+    pub fn to_val(&self) -> Val {
         match self {
-            ValType::I32 => write!(f, "i32"),
-            ValType::I64 => write!(f, "i64"),
-            ValType::F32 => write!(f, "f32"),
-            ValType::F64 => write!(f, "f64"),
+            Value::I32(v) => Val::I32(*v),
+            Value::I64(v) => Val::I64(*v),
+            Value::F32(v) => Val::F32(v.to_bits()),
+            Value::F64(v) => Val::F64(v.to_bits()),
+        }
+    }
+
+    /// Convert from a wasmtime Val.
+    pub fn from_val(val: &Val) -> anyhow::Result<Self> {
+        match val {
+            Val::I32(v) => Ok(Value::I32(*v)),
+            Val::I64(v) => Ok(Value::I64(*v)),
+            Val::F32(v) => Ok(Value::F32(f32::from_bits(*v))),
+            Val::F64(v) => Ok(Value::F64(f64::from_bits(*v))),
+            other => anyhow::bail!("Unsupported WASM value type: {:?}", other),
         }
     }
 }
 
-/// Function signature: parameter types and return types
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionSignature {
-    pub params: Vec<ValType>,
-    pub results: Vec<ValType>,
-}
-
-impl std::fmt::Display for FunctionSignature {
+impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "(")?;
-        for (i, p) in self.params.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "{}", p)?;
+        match self {
+            Value::I32(v) => write!(f, "{v}"),
+            Value::I64(v) => write!(f, "{v}"),
+            Value::F32(v) => write!(f, "{v}"),
+            Value::F64(v) => write!(f, "{v}"),
         }
-        write!(f, ") -> (")?;
-        for (i, r) in self.results.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "{}", r)?;
-        }
-        write!(f, ")")
     }
 }
 

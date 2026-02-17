@@ -8,6 +8,7 @@ use anyhow::Result;
 use llm::LlmClient;
 use runtime::WasmRuntime;
 use store::FunctionStore;
+use types::Value;
 
 const DB_PATH: &str = "qt45.db";
 const OLLAMA_URL: &str = "http://localhost:11434/v1/chat/completions";
@@ -22,8 +23,8 @@ fn synthesize(
     name: &str,
     description: &str,
     signature: &str,
-    args: &[i32],
-) -> Result<i32> {
+    args: &[Value],
+) -> Result<Vec<Value>> {
     println!("\nRequest: {name} ({description}) args: {args:?}");
 
     // 1. Check the store for a cached function
@@ -31,10 +32,8 @@ fn synthesize(
         println!("  [cache] found '{name}' (calls: {})", func.call_count);
 
         let module = if let Some(ref binary) = func.wasm_binary {
-            // Fast path: load pre-compiled binary
             runtime.load_cached(binary)?
         } else if let Some(ref source) = func.source_code {
-            // Recompile from source
             let (module, bytes) = runtime.compile_wat(source)?;
             store.save(name, description, signature, "wat", source, &bytes)?;
             module
@@ -42,10 +41,10 @@ fn synthesize(
             anyhow::bail!("Function '{name}' has no source or binary");
         };
 
-        let result = runtime.call_i32(&module, name, args)?;
+        let results = runtime.call(&module, name, args)?;
         store.record_call(name)?;
-        println!("  [wasm] {result}");
-        return Ok(result);
+        println!("  [wasm] {}", format_results(&results));
+        return Ok(results);
     }
 
     // 2. Generate via LLM
@@ -57,10 +56,18 @@ fn synthesize(
     store.save(name, description, signature, "wat", &wat, &bytes)?;
 
     // 4. Execute
-    let result = runtime.call_i32(&module, name, args)?;
+    let results = runtime.call(&module, name, args)?;
     store.record_call(name)?;
-    println!("  [wasm] {result}");
-    Ok(result)
+    println!("  [wasm] {}", format_results(&results));
+    Ok(results)
+}
+
+fn format_results(results: &[Value]) -> String {
+    results
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn main() -> Result<()> {
@@ -68,46 +75,68 @@ fn main() -> Result<()> {
     let runtime = WasmRuntime::new()?;
     let llm = LlmClient::new(OLLAMA_URL, OLLAMA_MODEL);
 
-    // Test 1: Generate "add" (first time hits LLM, second time uses cache)
+    // --- i32 tests (same as before) ---
+
     synthesize(
         &store, &runtime, &llm,
         "add", "adds two integers", "(i32, i32) -> i32",
-        &[10, 20],
+        &[Value::I32(10), Value::I32(20)],
     )?;
 
-    // Test 2: "add" again — should hit cache
+    // "add" again — should hit cache
     synthesize(
         &store, &runtime, &llm,
         "add", "adds two integers", "(i32, i32) -> i32",
-        &[100, 200],
+        &[Value::I32(100), Value::I32(200)],
     )?;
 
-    // Test 3: Generate "multiply"
     synthesize(
         &store, &runtime, &llm,
         "multiply", "multiplies two integers", "(i32, i32) -> i32",
-        &[5, 5],
+        &[Value::I32(5), Value::I32(5)],
     )?;
 
-    // Test 4: Something the mock couldn't do — subtract
     synthesize(
         &store, &runtime, &llm,
         "subtract", "subtracts the second integer from the first", "(i32, i32) -> i32",
-        &[50, 8],
+        &[Value::I32(50), Value::I32(8)],
     )?;
 
-    // Test 5: Something more interesting — max of two values
     synthesize(
         &store, &runtime, &llm,
         "max", "returns the larger of two integers", "(i32, i32) -> i32",
-        &[42, 17],
+        &[Value::I32(42), Value::I32(17)],
+    )?;
+
+    // --- New: single-arg i32 ---
+
+    synthesize(
+        &store, &runtime, &llm,
+        "negate", "returns the negation of an integer", "(i32) -> i32",
+        &[Value::I32(42)],
+    )?;
+
+    // --- New: f64 ---
+
+    synthesize(
+        &store, &runtime, &llm,
+        "circle_area", "returns the area of a circle given its radius (pi * r * r)", "(f64) -> f64",
+        &[Value::F64(5.0)],
+    )?;
+
+    // --- New: no args ---
+
+    synthesize(
+        &store, &runtime, &llm,
+        "answer", "returns the integer 42", "() -> i32",
+        &[],
     )?;
 
     // List all stored functions
     println!("\n--- Function Library ---");
     for f in store.list()? {
         println!(
-            "  {:<12} {} [calls: {}, verified: {}]",
+            "  {:<14} {:<20} [calls: {}, verified: {}]",
             f.name, f.signature, f.call_count, f.is_verified
         );
     }
