@@ -29,8 +29,10 @@ impl HybridSearch {
     /// Initialize the search system. Downloads the embedding model on first run (~50MB).
     pub fn new(store: &FunctionStore) -> Result<Self> {
         println!("[search] initializing embedding model...");
+        let cache_dir = std::path::PathBuf::from("cache");
         let model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::BGESmallENV15)
+                .with_cache_dir(cache_dir)
                 .with_show_download_progress(true),
         )?;
 
