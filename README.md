@@ -1,4 +1,4 @@
-# QT45
+# qt45wasm
 
 A self-improving agentic loop inspired by [QT45](https://www.science.org/doi/10.1126/science.adu3023), a 45-nucleotide RNA ribozyme capable of self-replication. An LLM synthesizes pure functions as WebAssembly modules, stores them in a persistent library, and reuses them to solve future problems. Each interaction makes the system more capable. The compute migrates from the probabilistic, expensive layer (LLM) to the deterministic, cheap layer (WASM) as the library grows. Just as QT45 catalyzes RNA-templated synthesis from a minimal motif — building complexity from simplicity in eutectic ice — this system starts with a minimal kernel and accumulates capability over time.
 
@@ -77,6 +77,12 @@ ollama pull qwen2.5-coder:7b
 git clone https://github.com/rcurrie/qt45.git qt45
 cd qt45
 cargo build
+```
+
+## Test
+
+```
+cargo test
 ```
 
 ## Run

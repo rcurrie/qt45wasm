@@ -206,10 +206,19 @@ impl LlmClient {
 
         let response = match self.chat(&messages) {
             Ok(r) => r,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                println!("  [test] LLM call failed: {e}");
+                return Vec::new();
+            }
         };
 
-        parse_array_test_cases(&response).unwrap_or_default()
+        match parse_array_test_cases(&response) {
+            Ok(cases) => cases,
+            Err(e) => {
+                println!("  [test] failed to parse array test cases: {e}");
+                Vec::new()
+            }
+        }
     }
 
     /// Generate a GPU WAT module that uses host function imports for compute dispatch.

@@ -8,9 +8,9 @@ All array lengths MUST be multiples of 4 (for SIMD alignment).
 
 Example for a function that adds two f32 arrays element-wise:
 [
-  {{"inputs": [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], "expected": [6.0, 8.0, 10.0, 12.0]}},
-  {{"inputs": [[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]], "expected": [1.0, 1.0, 1.0, 1.0]}},
-  {{"inputs": [[-1.0, -2.0, -3.0, -4.0], [1.0, 2.0, 3.0, 4.0]], "expected": [0.0, 0.0, 0.0, 0.0]}}
+  {"inputs": [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], "expected": [6.0, 8.0, 10.0, 12.0]},
+  {"inputs": [[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]], "expected": [1.0, 1.0, 1.0, 1.0]},
+  {"inputs": [[-1.0, -2.0, -3.0, -4.0], [1.0, 2.0, 3.0, 4.0]], "expected": [0.0, 0.0, 0.0, 0.0]}
 ]
 
 Output ONLY the JSON array. No markdown, no explanation.
