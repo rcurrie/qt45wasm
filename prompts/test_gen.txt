@@ -10,4 +10,11 @@ Example for an "add" function with signature (i32, i32) -> i32:
   {"input": [{"type": "i32", "value": -5}, {"type": "i32", "value": 10}], "expected": [{"type": "i32", "value": 5}]}
 ]
 
+Example for a "answer" function with signature () -> i32 (no parameters):
+[
+  {"input": [], "expected": [{"type": "i32", "value": 42}]}
+]
+
+IMPORTANT: The number of values in "input" MUST match the number of parameters in the signature. If the signature has no parameters like () -> i32, "input" MUST be an empty array [].
+
 Output ONLY the JSON array. No explanation, no markdown fences.

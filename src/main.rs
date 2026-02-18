@@ -1,5 +1,6 @@
 mod llm;
 mod runtime;
+mod search;
 mod store;
 mod types;
 
@@ -7,6 +8,7 @@ use anyhow::Result;
 
 use llm::LlmClient;
 use runtime::WasmRuntime;
+use search::HybridSearch;
 use store::FunctionStore;
 use types::Value;
 
@@ -20,6 +22,7 @@ fn synthesize(
     store: &FunctionStore,
     runtime: &WasmRuntime,
     llm: &LlmClient,
+    search: &mut HybridSearch,
     name: &str,
     description: &str,
     signature: &str,
@@ -27,7 +30,7 @@ fn synthesize(
 ) -> Result<Vec<Value>> {
     println!("\nRequest: {name} ({description}) args: {args:?}");
 
-    // 1. Check the store for a cached function
+    // 1. Check the store for a cached function (exact name match)
     if let Some(func) = store.get(name)? {
         let verified = if func.is_verified { "verified" } else { "unverified" };
         println!("  [cache] found '{name}' (calls: {}, {verified})", func.call_count);
@@ -48,6 +51,27 @@ fn synthesize(
         return Ok(results);
     }
 
+    // 1b. Search for a semantically similar existing function
+    if let Some(hit) = search.find(store, name, description, signature)? {
+        println!(
+            "  [search] matched '{}' via {} (score: {:.4})",
+            hit.function.name, hit.match_source, hit.score
+        );
+
+        let module = if let Some(ref binary) = hit.function.wasm_binary {
+            runtime.load_cached(binary)?
+        } else if let Some(ref source) = hit.function.source_code {
+            runtime.compile_wat(source)?.0
+        } else {
+            anyhow::bail!("Matched function '{}' has no source or binary", hit.function.name);
+        };
+
+        let results = runtime.call(&module, &hit.function.name, args)?;
+        store.record_call(&hit.function.name)?;
+        println!("  [wasm] {}", format_results(&results));
+        return Ok(results);
+    }
+
     // 2. Generate via LLM
     println!("  [cache] miss — generating via LLM...");
     let wat = llm.generate_wat(name, description, signature, runtime)?;
@@ -55,6 +79,11 @@ fn synthesize(
 
     // 3. Store for future reuse
     store.save(name, description, signature, "wat", &wat, &bytes)?;
+
+    // 3b. Generate embedding for the new function
+    if let Err(e) = search.embed_function(store, name, description) {
+        println!("  [search] warning: failed to embed function: {e}");
+    }
 
     // 4. Generate and run tests
     verify_function(store, runtime, llm, name, description, signature, &module);
@@ -141,62 +170,71 @@ fn main() -> Result<()> {
     let store = FunctionStore::new(DB_PATH)?;
     let runtime = WasmRuntime::new()?;
     let llm = LlmClient::new(OLLAMA_URL, OLLAMA_MODEL);
+    let mut search = HybridSearch::new(&store)?;
 
-    // --- i32 tests (same as before) ---
+    // --- i32 tests ---
 
     synthesize(
-        &store, &runtime, &llm,
+        &store, &runtime, &llm, &mut search,
         "add", "adds two integers", "(i32, i32) -> i32",
         &[Value::I32(10), Value::I32(20)],
     )?;
 
     // "add" again — should hit cache
     synthesize(
-        &store, &runtime, &llm,
+        &store, &runtime, &llm, &mut search,
         "add", "adds two integers", "(i32, i32) -> i32",
         &[Value::I32(100), Value::I32(200)],
     )?;
 
     synthesize(
-        &store, &runtime, &llm,
+        &store, &runtime, &llm, &mut search,
         "multiply", "multiplies two integers", "(i32, i32) -> i32",
         &[Value::I32(5), Value::I32(5)],
     )?;
 
     synthesize(
-        &store, &runtime, &llm,
+        &store, &runtime, &llm, &mut search,
         "subtract", "subtracts the second integer from the first", "(i32, i32) -> i32",
         &[Value::I32(50), Value::I32(8)],
     )?;
 
     synthesize(
-        &store, &runtime, &llm,
+        &store, &runtime, &llm, &mut search,
         "max", "returns the larger of two integers", "(i32, i32) -> i32",
         &[Value::I32(42), Value::I32(17)],
     )?;
 
-    // --- New: single-arg i32 ---
+    // --- single-arg i32 ---
 
     synthesize(
-        &store, &runtime, &llm,
+        &store, &runtime, &llm, &mut search,
         "negate", "returns the negation of an integer", "(i32) -> i32",
         &[Value::I32(42)],
     )?;
 
-    // --- New: f64 ---
+    // --- f64 ---
 
     synthesize(
-        &store, &runtime, &llm,
+        &store, &runtime, &llm, &mut search,
         "circle_area", "returns the area of a circle given its radius (pi * r * r)", "(f64) -> f64",
         &[Value::F64(5.0)],
     )?;
 
-    // --- New: no args ---
+    // --- no args ---
 
     synthesize(
-        &store, &runtime, &llm,
+        &store, &runtime, &llm, &mut search,
         "answer", "returns the integer 42", "() -> i32",
         &[],
+    )?;
+
+    // --- search test: "sum" should find existing "add" ---
+
+    synthesize(
+        &store, &runtime, &llm, &mut search,
+        "sum", "adds two numbers together", "(i32, i32) -> i32",
+        &[Value::I32(7), Value::I32(8)],
     )?;
 
     // List all stored functions

@@ -1,5 +1,7 @@
 use anyhow::Result;
+use rusqlite::ffi::sqlite3_auto_extension;
 use rusqlite::{params, Connection};
+use zerocopy::IntoBytes;
 
 use crate::types::{StoredFunction, TestCase, Value};
 
@@ -10,6 +12,13 @@ pub struct FunctionStore {
 
 impl FunctionStore {
     pub fn new(path: &str) -> Result<Self> {
+        // Register sqlite-vec extension before opening the connection
+        unsafe {
+            sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS functions (
@@ -31,8 +40,42 @@ impl FunctionStore {
                 input_json TEXT NOT NULL,
                 expected_json TEXT NOT NULL,
                 passed INTEGER DEFAULT 0
+            );
+
+            -- FTS5 external content table for keyword search
+            CREATE VIRTUAL TABLE IF NOT EXISTS functions_fts USING fts5(
+                name, description, content=functions, content_rowid=id
+            );
+
+            -- Sync triggers for FTS5 (INSERT OR REPLACE = DELETE + INSERT)
+            CREATE TRIGGER IF NOT EXISTS functions_ai AFTER INSERT ON functions BEGIN
+                INSERT INTO functions_fts(rowid, name, description)
+                VALUES (new.id, new.name, new.description);
+            END;
+            CREATE TRIGGER IF NOT EXISTS functions_ad AFTER DELETE ON functions BEGIN
+                INSERT INTO functions_fts(functions_fts, rowid, name, description)
+                VALUES ('delete', old.id, old.name, old.description);
+            END;
+            CREATE TRIGGER IF NOT EXISTS functions_au AFTER UPDATE ON functions BEGIN
+                INSERT INTO functions_fts(functions_fts, rowid, name, description)
+                VALUES ('delete', old.id, old.name, old.description);
+                INSERT INTO functions_fts(rowid, name, description)
+                VALUES (new.id, new.name, new.description);
+            END;
+
+            -- Vector embeddings for semantic search (384-dim BGE-small-en-v1.5)
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_functions USING vec0(
+                function_id INTEGER PRIMARY KEY,
+                embedding float[384] distance_metric=cosine
             );",
         )?;
+
+        // Backfill FTS5 for any pre-existing functions (idempotent)
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO functions_fts(rowid, name, description)
+             SELECT id, name, description FROM functions;",
+        )?;
+
         Ok(Self { conn })
     }
 
@@ -146,6 +189,35 @@ impl FunctionStore {
         self.conn.execute(
             "UPDATE functions SET is_verified = ?1 WHERE name = ?2",
             params![verified as i64, name],
+        )?;
+        Ok(())
+    }
+
+    /// Get a reference to the underlying connection (for the search module).
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Get the id of a function by name.
+    pub fn get_id(&self, name: &str) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM functions WHERE name = ?1")?;
+        let mut rows = stmt.query(params![name])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Insert or replace a vector embedding for a function.
+    pub fn upsert_embedding(&self, function_id: i64, embedding: &[f32]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM vec_functions WHERE function_id = ?1",
+            params![function_id],
+        )?;
+        self.conn.execute(
+            "INSERT INTO vec_functions(function_id, embedding) VALUES (?1, ?2)",
+            params![function_id, embedding.as_bytes()],
         )?;
         Ok(())
     }
