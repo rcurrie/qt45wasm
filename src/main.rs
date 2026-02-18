@@ -1,3 +1,5 @@
+mod bench;
+mod gpu;
 mod llm;
 mod runtime;
 mod search;
@@ -5,14 +7,16 @@ mod store;
 mod types;
 
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use gpu::GpuContext;
 use llm::LlmClient;
 use runtime::WasmRuntime;
 use search::HybridSearch;
 use store::FunctionStore;
-use types::Value;
+use types::{ArrayValue, ComputeTier, Value};
 
 const DB_PATH: &str = "qt45.db";
 const OLLAMA_URL: &str = "http://localhost:11434/v1/chat/completions";
@@ -95,6 +99,250 @@ fn synthesize(
     store.record_call(name)?;
     println!("  [wasm] {}", format_results(&results));
     Ok(results)
+}
+
+/// SIMD synthesis: generate, store, verify, and execute an array-processing function.
+fn synthesize_array(
+    store: &FunctionStore,
+    runtime: &WasmRuntime,
+    llm: &LlmClient,
+    search: &mut HybridSearch,
+    name: &str,
+    description: &str,
+    inputs: &[ArrayValue],
+) -> Result<ArrayValue> {
+    let result_count = inputs.first().map(|a| a.element_count()).unwrap_or(0);
+    println!("\nRequest [simd]: {name} ({description}) inputs: {}", inputs.len());
+
+    // 1. Check cache
+    if let Some(func) = store.get(name)? {
+        if func.compute_tier == ComputeTier::Simd {
+            let verified = if func.is_verified { "verified" } else { "unverified" };
+            println!("  [cache] found '{name}' simd (calls: {}, {verified})", func.call_count);
+
+            let module = if let Some(ref binary) = func.wasm_binary {
+                runtime.load_cached(binary)?
+            } else if let Some(ref source) = func.source_code {
+                let (module, bytes) = runtime.compile_wat(source)?;
+                store.save_with_tier(name, description, "", "wat", source, &bytes, ComputeTier::Simd, None)?;
+                module
+            } else {
+                anyhow::bail!("Function '{name}' has no source or binary");
+            };
+
+            let result = runtime.call_array(&module, name, inputs, result_count)?;
+            store.record_call(name)?;
+            println!("  [simd] {result}");
+            return Ok(result);
+        }
+    }
+
+    // 2. Generate via LLM
+    println!("  [cache] miss — generating SIMD via LLM...");
+    let memory_layout = build_memory_layout(inputs);
+    let wat = llm.generate_simd_wat(name, description, &memory_layout, runtime)?;
+    let (module, bytes) = runtime.compile_wat(&wat)?;
+
+    // 3. Store
+    store.save_with_tier(name, description, "simd", "wat", &wat, &bytes, ComputeTier::Simd, None)?;
+
+    // 3b. Embed
+    if let Err(e) = search.embed_function(store, name, description) {
+        println!("  [search] warning: failed to embed function: {e}");
+    }
+
+    // 4. Verify with LLM-generated array tests
+    verify_array_function(store, runtime, llm, name, description, &module);
+
+    // 5. Execute
+    let result = runtime.call_array(&module, name, inputs, result_count)?;
+    store.record_call(name)?;
+    println!("  [simd] {result}");
+    Ok(result)
+}
+
+/// Build a memory layout description for the LLM.
+fn build_memory_layout(inputs: &[ArrayValue]) -> String {
+    let mut parts = Vec::new();
+    let labels = ["A", "B", "C", "D"];
+    let mut offset_expr = String::new();
+    for (i, input) in inputs.iter().enumerate() {
+        let label = labels.get(i).unwrap_or(&"X");
+        let count = input.element_count();
+        if i == 0 {
+            parts.push(format!("{label}: f32[N] at offset 0 (N={count})"));
+            offset_expr = format!("{count}*4");
+        } else {
+            parts.push(format!("{label}: f32[N] at offset {offset_expr}"));
+            offset_expr = format!("{}*4", count * (i + 1));
+        }
+    }
+    parts.push(format!("Result: f32[N] at offset {offset_expr}"));
+    parts.join(", ")
+}
+
+/// Verify an array function using LLM-generated test cases.
+fn verify_array_function(
+    store: &FunctionStore,
+    runtime: &WasmRuntime,
+    llm: &LlmClient,
+    name: &str,
+    description: &str,
+    module: &wasmtime::Module,
+) {
+    println!("  [test] generating simd test cases...");
+    let test_cases = llm.generate_simd_tests(name, description);
+    if test_cases.is_empty() {
+        println!("  [test] no simd test cases generated");
+        return;
+    }
+
+    let mut passed = 0;
+    let total = test_cases.len();
+
+    for tc in &test_cases {
+        let result_count = tc.expected.element_count();
+        match runtime.call_array(module, name, &tc.inputs, result_count) {
+            Ok(actual) => {
+                if actual.approx_eq(&tc.expected) {
+                    passed += 1;
+                } else {
+                    println!("  [test] FAIL: {name}(...) = {actual} (expected {})", tc.expected);
+                }
+            }
+            Err(e) => {
+                println!("  [test] ERROR: {name}(...) — {e}");
+            }
+        }
+    }
+
+    if passed == total {
+        let _ = store.set_verified(name, true);
+        println!("  [test] {passed}/{total} passed — verified");
+    } else {
+        println!("  [test] {passed}/{total} passed");
+    }
+}
+
+/// GPU synthesis: generate, store, verify, and execute a GPU-accelerated function.
+fn synthesize_gpu(
+    store: &FunctionStore,
+    runtime: &WasmRuntime,
+    llm: &LlmClient,
+    search: &mut HybridSearch,
+    gpu: &Arc<Mutex<GpuContext>>,
+    name: &str,
+    description: &str,
+    inputs: &[ArrayValue],
+) -> Result<ArrayValue> {
+    let result_count = inputs.first().map(|a| a.element_count()).unwrap_or(0);
+    println!("\nRequest [gpu]: {name} ({description}) inputs: {}", inputs.len());
+
+    // 1. Check cache
+    if let Some(func) = store.get(name)? {
+        if func.compute_tier == ComputeTier::Gpu {
+            let verified = if func.is_verified { "verified" } else { "unverified" };
+            println!("  [cache] found '{name}' gpu (calls: {}, {verified})", func.call_count);
+
+            let module = if let Some(ref binary) = func.wasm_binary {
+                runtime.load_cached(binary)?
+            } else if let Some(ref source) = func.source_code {
+                let (module, bytes) = runtime.compile_wat(source)?;
+                store.save_with_tier(name, description, "", "wat", source, &bytes, ComputeTier::Gpu, func.shader_source.as_deref())?;
+                module
+            } else {
+                anyhow::bail!("Function '{name}' has no source or binary");
+            };
+
+            let result = runtime.call_gpu(&module, name, gpu, inputs, result_count)?;
+            store.record_call(name)?;
+            println!("  [gpu] {result}");
+            return Ok(result);
+        }
+    }
+
+    // 2. Generate via LLM
+    println!("  [cache] miss — generating GPU via LLM...");
+    let memory_layout = build_memory_layout(inputs);
+    let wat = llm.generate_gpu_wat(name, description, &memory_layout, runtime)?;
+    let (module, bytes) = runtime.compile_wat(&wat)?;
+
+    // Extract WGSL from the WAT data segment for storage
+    let wgsl = extract_wgsl_from_wat(&wat);
+
+    // 3. Store
+    store.save_with_tier(name, description, "gpu", "wat", &wat, &bytes, ComputeTier::Gpu, wgsl.as_deref())?;
+
+    // 3b. Embed
+    if let Err(e) = search.embed_function(store, name, description) {
+        println!("  [search] warning: failed to embed function: {e}");
+    }
+
+    // 4. Verify with LLM-generated tests (reuse SIMD tests — same array format)
+    verify_gpu_function(store, runtime, llm, gpu, name, description, &module);
+
+    // 5. Execute
+    let result = runtime.call_gpu(&module, name, gpu, inputs, result_count)?;
+    store.record_call(name)?;
+    println!("  [gpu] {result}");
+    Ok(result)
+}
+
+/// Extract the WGSL shader string from a WAT data segment at offset 4096.
+fn extract_wgsl_from_wat(wat: &str) -> Option<String> {
+    // Look for (data (i32.const 4096) "...")
+    let marker = "(data (i32.const 4096)";
+    let start = wat.find(marker)?;
+    let after = &wat[start + marker.len()..];
+    let quote_start = after.find('"')? + 1;
+    let quote_end = after[quote_start..].find('"')?;
+    let escaped = &after[quote_start..quote_start + quote_end];
+    // Unescape \0a → newline
+    Some(escaped.replace("\\0a", "\n"))
+}
+
+/// Verify a GPU function using LLM-generated test cases.
+fn verify_gpu_function(
+    store: &FunctionStore,
+    runtime: &WasmRuntime,
+    llm: &LlmClient,
+    gpu: &Arc<Mutex<GpuContext>>,
+    name: &str,
+    description: &str,
+    module: &wasmtime::Module,
+) {
+    println!("  [test] generating gpu test cases...");
+    let test_cases = llm.generate_simd_tests(name, description);
+    if test_cases.is_empty() {
+        println!("  [test] no gpu test cases generated");
+        return;
+    }
+
+    let mut passed = 0;
+    let total = test_cases.len();
+
+    for tc in &test_cases {
+        let result_count = tc.expected.element_count();
+        match runtime.call_gpu(module, name, gpu, &tc.inputs, result_count) {
+            Ok(actual) => {
+                if actual.approx_eq(&tc.expected) {
+                    passed += 1;
+                } else {
+                    println!("  [test] FAIL: {name}(...) = {actual} (expected {})", tc.expected);
+                }
+            }
+            Err(e) => {
+                println!("  [test] ERROR: {name}(...) — {e}");
+            }
+        }
+    }
+
+    if passed == total {
+        let _ = store.set_verified(name, true);
+        println!("  [test] {passed}/{total} passed — verified");
+    } else {
+        println!("  [test] {passed}/{total} passed");
+    }
 }
 
 /// Generate test cases via LLM, run them, and mark the function as verified if all pass.
@@ -255,6 +503,54 @@ fn parse_call(input: &str) -> Result<(String, String, String, Vec<Value>)> {
     Ok((name.to_string(), description.to_string(), signature, args))
 }
 
+/// Parse a SIMD array call: name "description" [1,2,3,4] [5,6,7,8]
+fn parse_array_call(input: &str) -> Result<(String, String, Vec<ArrayValue>)> {
+    let input = input.trim();
+
+    // 1. Extract name
+    let name_end = input
+        .find(|c: char| c.is_whitespace())
+        .ok_or_else(|| anyhow::anyhow!("Expected: name \"description\" [array1] [array2]"))?;
+    let name = &input[..name_end];
+
+    // 2. Extract description
+    let rest = input[name_end..].trim_start();
+    if !rest.starts_with('"') {
+        anyhow::bail!("Expected quoted description after function name");
+    }
+    let desc_end = rest[1..]
+        .find('"')
+        .ok_or_else(|| anyhow::anyhow!("Unterminated description string"))?;
+    let description = &rest[1..=desc_end];
+    let rest = rest[desc_end + 2..].trim_start();
+
+    // 3. Parse arrays: each is [num, num, ...]
+    let mut arrays = Vec::new();
+    let mut remaining = rest;
+    while let Some(start) = remaining.find('[') {
+        let end = remaining[start..]
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("Unterminated array bracket"))?;
+        let array_str = &remaining[start + 1..start + end];
+        let vals: Vec<f32> = array_str
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<f32>()
+                    .context("Invalid f32 in array")
+            })
+            .collect::<Result<_>>()?;
+        arrays.push(ArrayValue::F32Array(vals));
+        remaining = &remaining[start + end + 1..];
+    }
+
+    if arrays.is_empty() {
+        anyhow::bail!("Expected at least one array argument [...]");
+    }
+
+    Ok((name.to_string(), description.to_string(), arrays))
+}
+
 fn parse_param_types(signature: &str) -> Result<Vec<String>> {
     let open = signature
         .find('(')
@@ -304,15 +600,15 @@ fn cmd_list(store: &FunctionStore) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<16} {:<24} {:>6}  {}",
-        "NAME", "SIGNATURE", "CALLS", "VERIFIED"
+        "{:<16} {:<24} {:>6}  {:<8} {}",
+        "NAME", "SIGNATURE", "CALLS", "TIER", "VERIFIED"
     );
-    println!("{}", "-".repeat(60));
+    println!("{}", "-".repeat(68));
     for f in &functions {
         let verified = if f.is_verified { "yes" } else { "no" };
         println!(
-            "{:<16} {:<24} {:>6}  {}",
-            f.name, f.signature, f.call_count, verified
+            "{:<16} {:<24} {:>6}  {:<8} {}",
+            f.name, f.signature, f.call_count, f.compute_tier, verified
         );
     }
     Ok(())
@@ -328,6 +624,7 @@ fn cmd_info(store: &FunctionStore, name: &str) -> Result<()> {
             println!("Description: {}", f.description);
             println!("Signature:   {}", f.signature);
             println!("Language:    {}", f.source_lang);
+            println!("Tier:        {}", f.compute_tier);
             println!("Calls:       {}", f.call_count);
             println!("Verified:    {}", f.is_verified);
         }
@@ -388,28 +685,97 @@ fn cmd_delete(store: &FunctionStore, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_bench(store: &FunctionStore, runtime: &WasmRuntime, gpu: &Option<Arc<Mutex<GpuContext>>>, arg: &str) -> Result<()> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    if parts.len() < 2 {
+        anyhow::bail!("Usage: .bench <function_name> <size>");
+    }
+    let name = parts[0];
+    let size: usize = parts[1].parse().context("Invalid size")?;
+    let iterations = 100;
+
+    let func = store
+        .get(name)?
+        .ok_or_else(|| anyhow::anyhow!("Function '{name}' not found"))?;
+
+    let module = if let Some(ref binary) = func.wasm_binary {
+        runtime.load_cached(binary)?
+    } else if let Some(ref source) = func.source_code {
+        runtime.compile_wat(source)?.0
+    } else {
+        anyhow::bail!("Function '{name}' has no source or binary");
+    };
+
+    // Generate test data (two arrays for binary ops)
+    let a = bench::random_f32_array(size);
+    let b = bench::random_f32_array(size);
+
+    println!("\nBenchmark: {name} (size={size}, iterations={iterations})");
+
+    match func.compute_tier {
+        ComputeTier::Simd => {
+            let result = bench::bench_array(runtime, &module, name, ComputeTier::Simd, &[a, b], size, iterations)?;
+            bench::print_results(&[result]);
+        }
+        ComputeTier::Gpu => {
+            let gpu = gpu.as_ref().ok_or_else(|| anyhow::anyhow!("GPU not initialized"))?;
+            let result = bench::bench_gpu(runtime, &module, name, gpu, &[a, b], size, iterations)?;
+            bench::print_results(&[result]);
+        }
+        ComputeTier::Scalar => {
+            anyhow::bail!("Cannot benchmark scalar functions with .bench (use scalar call instead)");
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_shader(store: &FunctionStore, name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("Usage: .shader <function_name>");
+    }
+    match store.get(name)? {
+        Some(f) => match f.shader_source {
+            Some(src) => println!("{src}"),
+            None => println!("Function '{name}' has no WGSL shader stored."),
+        },
+        None => println!("Function '{name}' not found."),
+    }
+    Ok(())
+}
+
 fn cmd_help() {
     println!("COMMANDS:");
     println!("  .list              List all stored functions");
     println!("  .info <name>       Show function details");
     println!("  .source <name>     Print WAT source code");
+    println!("  .shader <name>     Print WGSL shader source (GPU functions)");
     println!("  .tests <name>      Show test cases");
     println!("  .delete <name>     Delete a function");
+    println!("  .bench <name> <n>  Benchmark a SIMD/GPU function with n elements");
     println!("  .help              Show this help");
     println!("  .quit / .exit      Exit the REPL");
     println!();
-    println!("FUNCTION CALLS:");
+    println!("SCALAR FUNCTION CALLS:");
     println!("  name \"description\" (types) -> return_type : arg1, arg2");
+    println!();
+    println!("SIMD ARRAY CALLS:");
+    println!("  simd name \"description\" [1,2,3,4] [5,6,7,8]");
+    println!();
+    println!("GPU ARRAY CALLS:");
+    println!("  gpu name \"description\" [1,2,3,4] [5,6,7,8]");
     println!();
     println!("EXAMPLES:");
     println!("  add \"adds two integers\" (i32, i32) -> i32 : 10, 20");
     println!("  circle_area \"pi * r^2\" (f64) -> f64 : 5.0");
     println!("  answer \"returns 42\" () -> i32");
+    println!("  simd vec_add_f32 \"element-wise add\" [1,2,3,4] [5,6,7,8]");
+    println!("  gpu gpu_double_f32 \"double all elements\" [1,2,3,4]");
 }
 
 // --- REPL loop ---
 
-fn handle_command(input: &str, store: &FunctionStore) -> Result<()> {
+fn handle_command(input: &str, store: &FunctionStore, runtime: &WasmRuntime, gpu: &Option<Arc<Mutex<GpuContext>>>) -> Result<()> {
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     let cmd = parts[0];
     let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
@@ -418,8 +784,10 @@ fn handle_command(input: &str, store: &FunctionStore) -> Result<()> {
         ".list" => cmd_list(store),
         ".info" => cmd_info(store, arg),
         ".source" => cmd_source(store, arg),
+        ".shader" => cmd_shader(store, arg),
         ".tests" => cmd_tests(store, arg),
         ".delete" => cmd_delete(store, arg),
+        ".bench" => cmd_bench(store, runtime, gpu, arg),
         ".help" => {
             cmd_help();
             Ok(())
@@ -440,6 +808,9 @@ fn run_repl(
 ) -> Result<()> {
     println!("qt45 — type .help for commands, .quit to exit\n");
 
+    // Lazy GPU context — only initialized on first gpu command
+    let mut gpu_ctx: Option<Arc<Mutex<GpuContext>>> = None;
+
     loop {
         print!("qt45> ");
         std::io::stdout().flush()?;
@@ -458,11 +829,54 @@ fn run_repl(
 
         if trimmed.starts_with('.') {
             let should_quit = trimmed == ".quit" || trimmed == ".exit";
-            if let Err(e) = handle_command(trimmed, store) {
+            if let Err(e) = handle_command(trimmed, store, runtime, &gpu_ctx) {
                 eprintln!("Error: {e}");
             }
             if should_quit {
                 break;
+            }
+        } else if trimmed.starts_with("simd ") {
+            // SIMD array call
+            match parse_array_call(&trimmed[5..]) {
+                Ok((name, description, arrays)) => {
+                    match synthesize_array(store, runtime, llm, search, &name, &description, &arrays) {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Error: {e:#}"),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Parse error: {e}");
+                    eprintln!("Format: simd name \"description\" [1,2,3,4] [5,6,7,8]");
+                }
+            }
+        } else if trimmed.starts_with("gpu ") {
+            // Lazy GPU init
+            if gpu_ctx.is_none() {
+                println!("  [gpu] initializing GPU context...");
+                match GpuContext::new() {
+                    Ok(ctx) => {
+                        println!("  [gpu] adapter: {}", ctx.adapter_name());
+                        gpu_ctx = Some(Arc::new(Mutex::new(ctx)));
+                    }
+                    Err(e) => {
+                        eprintln!("Error: failed to initialize GPU: {e}");
+                        continue;
+                    }
+                }
+            }
+            let gpu = gpu_ctx.as_ref().unwrap();
+
+            match parse_array_call(&trimmed[4..]) {
+                Ok((name, description, arrays)) => {
+                    match synthesize_gpu(store, runtime, llm, search, gpu, &name, &description, &arrays) {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Error: {e:#}"),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Parse error: {e}");
+                    eprintln!("Format: gpu name \"description\" [1,2,3,4] [5,6,7,8]");
+                }
             }
         } else {
             match parse_call(trimmed) {
@@ -546,11 +960,64 @@ fn run_demo(
         &[Value::I32(7), Value::I32(8)],
     )?;
 
+    // --- SIMD demo ---
+    println!("\n=== SIMD Demo ===");
+    synthesize_array(
+        store, runtime, llm, search,
+        "vec_add_f32", "element-wise addition of two f32 arrays",
+        &[
+            ArrayValue::F32Array(vec![1.0, 2.0, 3.0, 4.0]),
+            ArrayValue::F32Array(vec![10.0, 20.0, 30.0, 40.0]),
+        ],
+    )?;
+
+    synthesize_array(
+        store, runtime, llm, search,
+        "vec_add_f32", "element-wise addition of two f32 arrays",
+        &[
+            ArrayValue::F32Array(vec![100.0, 200.0, 300.0, 400.0]),
+            ArrayValue::F32Array(vec![0.5, 0.5, 0.5, 0.5]),
+        ],
+    )?;
+
+    // --- GPU demo ---
+    println!("\n=== GPU Demo ===");
+    println!("  [gpu] initializing GPU context...");
+    let gpu = match GpuContext::new() {
+        Ok(ctx) => {
+            println!("  [gpu] adapter: {}", ctx.adapter_name());
+            Arc::new(Mutex::new(ctx))
+        }
+        Err(e) => {
+            eprintln!("  [gpu] skipping GPU demo — failed to initialize: {e}");
+            println!("\n--- Function Library ---");
+            for f in store.list()? {
+                println!(
+                    "  {:<14} {:<20} [calls: {}, tier: {}, verified: {}]",
+                    f.name, f.signature, f.call_count, f.compute_tier, f.is_verified
+                );
+            }
+            return Ok(());
+        }
+    };
+
+    synthesize_gpu(
+        store, runtime, llm, search, &gpu,
+        "gpu_double_f32", "double all elements of an f32 array",
+        &[ArrayValue::F32Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
+    )?;
+
+    synthesize_gpu(
+        store, runtime, llm, search, &gpu,
+        "gpu_double_f32", "double all elements of an f32 array",
+        &[ArrayValue::F32Array(vec![10.0, 20.0, 30.0, 40.0])],
+    )?;
+
     println!("\n--- Function Library ---");
     for f in store.list()? {
         println!(
-            "  {:<14} {:<20} [calls: {}, verified: {}]",
-            f.name, f.signature, f.call_count, f.is_verified
+            "  {:<14} {:<20} [calls: {}, tier: {}, verified: {}]",
+            f.name, f.signature, f.call_count, f.compute_tier, f.is_verified
         );
     }
 
@@ -638,5 +1105,25 @@ mod repl_tests {
     fn test_parse_call_missing_args_errors() {
         let result = parse_call(r#"add "adds two" (i32, i32) -> i32"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_array_call_basic() {
+        let (name, desc, arrays) =
+            parse_array_call(r#"vec_add_f32 "add two arrays" [1,2,3,4] [5,6,7,8]"#).unwrap();
+        assert_eq!(name, "vec_add_f32");
+        assert_eq!(desc, "add two arrays");
+        assert_eq!(arrays.len(), 2);
+        match &arrays[0] {
+            ArrayValue::F32Array(v) => assert_eq!(v, &[1.0, 2.0, 3.0, 4.0]),
+            _ => panic!("expected F32Array"),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_call_single() {
+        let (_, _, arrays) =
+            parse_array_call(r#"vec_negate "negate array" [1.5, -2.5, 3.0, 4.0]"#).unwrap();
+        assert_eq!(arrays.len(), 1);
     }
 }

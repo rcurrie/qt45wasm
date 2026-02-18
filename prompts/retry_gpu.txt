@@ -1,0 +1,14 @@
+That WAT code failed to compile with error:
+{error}
+
+Common GPU WAT mistakes to avoid:
+- All four gpu imports must be declared before memory and functions
+- Import syntax: (import "gpu" "alloc" (func $gpu_alloc (param i32) (result i32)))
+- WGSL data segment must use \0a for newlines, not actual newlines
+- The WGSL string byte length in gpu_dispatch must exactly match the data segment length
+- Memory must be exported: (memory (export "memory") 1)
+- NEVER use numeric type/function indices — use named $variables
+- The WGSL shader must have: @group(0) @binding(0) var<storage, read_write> data: array<f32>;
+- The function must return i32 (byte offset of result in linear memory)
+
+Fix the code. Output ONLY the corrected WAT module starting with (module and ending with ).

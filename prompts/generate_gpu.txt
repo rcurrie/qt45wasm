@@ -1,0 +1,9 @@
+Generate a WAT module that uses GPU compute for a function named "{name}".
+Description: {description}
+Memory layout: {memory_layout}
+The element count is passed as the second i32 parameter.
+Include a WGSL compute shader as a data segment at offset 4096.
+Use \0a for newlines in the WGSL string.
+The shader must use @group(0) @binding(0) var<storage, read_write> data: array<f32>;
+Workgroup size: 64. Compute workgroups = ceil(len / 64).
+IMPORTANT: Count the exact byte length of your WGSL string and use that value in the gpu_dispatch call.

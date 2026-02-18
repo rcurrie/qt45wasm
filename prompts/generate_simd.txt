@@ -1,0 +1,6 @@
+Generate a WAT module with SIMD v128 operations for a function named "{name}".
+Description: {description}
+Memory layout: {memory_layout}
+The element count is passed as the second i32 parameter.
+Use v128.load, v128.store, and f32x4.* operations to process 4 floats per loop iteration.
+The function returns the byte offset where results are stored in memory.

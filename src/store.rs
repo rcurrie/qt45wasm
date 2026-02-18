@@ -3,7 +3,7 @@ use rusqlite::ffi::sqlite3_auto_extension;
 use rusqlite::{params, Connection};
 use zerocopy::IntoBytes;
 
-use crate::types::{StoredFunction, TestCase, Value};
+use crate::types::{ComputeTier, StoredFunction, TestCase, Value};
 
 /// Persistent storage for functions and their compiled WASM binaries.
 pub struct FunctionStore {
@@ -70,6 +70,10 @@ impl FunctionStore {
             );",
         )?;
 
+        // Migration: add compute_tier and shader_source columns if they don't exist
+        Self::migrate_add_column(&conn, "functions", "compute_tier", "TEXT NOT NULL DEFAULT 'scalar'")?;
+        Self::migrate_add_column(&conn, "functions", "shader_source", "TEXT")?;
+
         // Backfill FTS5 for any pre-existing functions (idempotent)
         conn.execute_batch(
             "INSERT OR IGNORE INTO functions_fts(rowid, name, description)
@@ -79,15 +83,28 @@ impl FunctionStore {
         Ok(Self { conn })
     }
 
+    /// Safely add a column if it doesn't already exist.
+    fn migrate_add_column(conn: &Connection, table: &str, column: &str, col_type: &str) -> Result<()> {
+        let has_column: bool = conn
+            .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
+            .is_ok();
+        if !has_column {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {col_type};"))?;
+        }
+        Ok(())
+    }
+
     /// Look up a function by name.
     pub fn get(&self, name: &str) -> Result<Option<StoredFunction>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, signature, source_lang, source_code, wasm_binary, call_count, is_verified
+            "SELECT id, name, description, signature, source_lang, source_code, wasm_binary,
+                    call_count, is_verified, compute_tier, shader_source
              FROM functions WHERE name = ?1",
         )?;
         let mut rows = stmt.query(params![name])?;
 
         if let Some(row) = rows.next()? {
+            let tier_str: String = row.get(9)?;
             Ok(Some(StoredFunction {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -98,6 +115,8 @@ impl FunctionStore {
                 wasm_binary: row.get(6)?,
                 call_count: row.get(7)?,
                 is_verified: row.get::<_, i64>(8)? != 0,
+                compute_tier: ComputeTier::from_str(&tier_str),
+                shader_source: row.get(10)?,
             }))
         } else {
             Ok(None)
@@ -114,12 +133,28 @@ impl FunctionStore {
         source_code: &str,
         wasm_binary: &[u8],
     ) -> Result<()> {
+        self.save_with_tier(name, description, signature, source_lang, source_code, wasm_binary, ComputeTier::Scalar, None)
+    }
+
+    /// Save a new function with explicit compute tier and optional shader source.
+    pub fn save_with_tier(
+        &self,
+        name: &str,
+        description: &str,
+        signature: &str,
+        source_lang: &str,
+        source_code: &str,
+        wasm_binary: &[u8],
+        tier: ComputeTier,
+        shader_source: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO functions (name, description, signature, source_lang, source_code, wasm_binary)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![name, description, signature, source_lang, source_code, wasm_binary],
+            "INSERT OR REPLACE INTO functions
+             (name, description, signature, source_lang, source_code, wasm_binary, compute_tier, shader_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![name, description, signature, source_lang, source_code, wasm_binary, tier.as_str(), shader_source],
         )?;
-        println!("  [store] saved function: '{}'", name);
+        println!("  [store] saved function: '{}' (tier: {})", name, tier);
         Ok(())
     }
 
@@ -241,13 +276,15 @@ impl FunctionStore {
         Ok(())
     }
 
-    /// List all stored functions (name, signature, call_count, is_verified).
+    /// List all stored functions.
     pub fn list(&self) -> Result<Vec<StoredFunction>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, signature, source_lang, source_code, wasm_binary, call_count, is_verified
+            "SELECT id, name, description, signature, source_lang, source_code, wasm_binary,
+                    call_count, is_verified, compute_tier, shader_source
              FROM functions ORDER BY name",
         )?;
         let rows = stmt.query_map([], |row| {
+            let tier_str: String = row.get(9)?;
             Ok(StoredFunction {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -258,6 +295,8 @@ impl FunctionStore {
                 wasm_binary: row.get(6)?,
                 call_count: row.get(7)?,
                 is_verified: row.get::<_, i64>(8)? != 0,
+                compute_tier: ComputeTier::from_str(&tier_str),
+                shader_source: row.get(10)?,
             })
         })?;
         let mut fns = Vec::new();

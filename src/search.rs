@@ -6,7 +6,7 @@ use rusqlite::params;
 use zerocopy::IntoBytes;
 
 use crate::store::FunctionStore;
-use crate::types::StoredFunction;
+use crate::types::{ComputeTier, StoredFunction};
 
 const RRF_K: f64 = 60.0;
 const SCORE_THRESHOLD: f64 = 0.025;
@@ -122,10 +122,12 @@ impl HybridSearch {
 
             let conn = store.connection();
             let func = conn.query_row(
-                "SELECT id, name, description, signature, source_lang, source_code, wasm_binary, call_count, is_verified
+                "SELECT id, name, description, signature, source_lang, source_code, wasm_binary,
+                        call_count, is_verified, compute_tier, shader_source
                  FROM functions WHERE id = ?1",
                 params![func_id],
                 |row| {
+                    let tier_str: String = row.get(9)?;
                     Ok(StoredFunction {
                         id: row.get(0)?,
                         name: row.get(1)?,
@@ -136,6 +138,8 @@ impl HybridSearch {
                         wasm_binary: row.get(6)?,
                         call_count: row.get(7)?,
                         is_verified: row.get::<_, i64>(8)? != 0,
+                        compute_tier: ComputeTier::from_str(&tier_str),
+                        shader_source: row.get(10)?,
                     })
                 },
             )?;

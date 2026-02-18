@@ -120,6 +120,162 @@ impl LlmClient {
         unreachable!()
     }
 
+    /// Generate a SIMD WAT module for array-processing functions.
+    /// Uses v128 operations and the memory calling convention.
+    pub fn generate_simd_wat(
+        &self,
+        name: &str,
+        description: &str,
+        memory_layout: &str,
+        runtime: &WasmRuntime,
+    ) -> Result<String> {
+        let system_prompt = load_prompt("system_simd.txt")?
+            .replace("{name}", name);
+
+        let user_prompt = load_prompt("generate_simd.txt")?
+            .replace("{name}", name)
+            .replace("{description}", description)
+            .replace("{memory_layout}", memory_layout);
+
+        let mut messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: system_prompt,
+            },
+            Message {
+                role: "user".to_string(),
+                content: user_prompt,
+            },
+        ];
+
+        for attempt in 1..=MAX_RETRIES {
+            println!("  [llm] simd attempt {attempt}/{MAX_RETRIES}...");
+
+            let response_text = self.chat(&messages)?;
+            let wat = extract_wat(&response_text);
+
+            match runtime.compile_wat(&wat) {
+                Ok(_) => {
+                    println!("  [llm] simd compilation successful");
+                    return Ok(wat);
+                }
+                Err(e) if attempt < MAX_RETRIES => {
+                    let error_msg = format!("{e:#}");
+                    println!("  [llm] simd compilation failed: {error_msg}");
+
+                    messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: response_text,
+                    });
+                    let retry_prompt = load_prompt("retry_simd.txt")?
+                        .replace("{error}", &error_msg);
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: retry_prompt,
+                    });
+                }
+                Err(e) => {
+                    return Err(e).context(format!(
+                        "LLM failed to generate valid SIMD WAT for '{name}' after {MAX_RETRIES} attempts"
+                    ));
+                }
+            }
+        }
+
+        unreachable!()
+    }
+
+    /// Generate array test cases for a SIMD function.
+    /// Non-fatal: returns an empty vec on failure.
+    pub fn generate_simd_tests(
+        &self,
+        name: &str,
+        description: &str,
+    ) -> Vec<crate::types::ArrayTestCase> {
+        let prompt = match load_prompt("test_gen_simd.txt") {
+            Ok(p) => p
+                .replace("{name}", name)
+                .replace("{description}", description),
+            Err(_) => return Vec::new(),
+        };
+
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: prompt,
+        }];
+
+        let response = match self.chat(&messages) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        parse_array_test_cases(&response).unwrap_or_default()
+    }
+
+    /// Generate a GPU WAT module that uses host function imports for compute dispatch.
+    pub fn generate_gpu_wat(
+        &self,
+        name: &str,
+        description: &str,
+        memory_layout: &str,
+        runtime: &WasmRuntime,
+    ) -> Result<String> {
+        let system_prompt = load_prompt("system_gpu.txt")?
+            .replace("{name}", name);
+
+        let user_prompt = load_prompt("generate_gpu.txt")?
+            .replace("{name}", name)
+            .replace("{description}", description)
+            .replace("{memory_layout}", memory_layout);
+
+        let mut messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: system_prompt,
+            },
+            Message {
+                role: "user".to_string(),
+                content: user_prompt,
+            },
+        ];
+
+        for attempt in 1..=MAX_RETRIES {
+            println!("  [llm] gpu attempt {attempt}/{MAX_RETRIES}...");
+
+            let response_text = self.chat(&messages)?;
+            let wat = extract_wat(&response_text);
+
+            match runtime.compile_wat(&wat) {
+                Ok(_) => {
+                    println!("  [llm] gpu compilation successful");
+                    return Ok(wat);
+                }
+                Err(e) if attempt < MAX_RETRIES => {
+                    let error_msg = format!("{e:#}");
+                    println!("  [llm] gpu compilation failed: {error_msg}");
+
+                    messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: response_text,
+                    });
+                    let retry_prompt = load_prompt("retry_gpu.txt")?
+                        .replace("{error}", &error_msg);
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: retry_prompt,
+                    });
+                }
+                Err(e) => {
+                    return Err(e).context(format!(
+                        "LLM failed to generate valid GPU WAT for '{name}' after {MAX_RETRIES} attempts"
+                    ));
+                }
+            }
+        }
+
+        unreachable!()
+    }
+
     /// Generate test cases for a function. Returns parsed TestCases.
     /// Non-fatal: returns an empty vec on failure rather than propagating errors.
     pub fn generate_tests(
@@ -296,6 +452,49 @@ fn extract_json(response: &str) -> String {
     }
 
     text.to_string()
+}
+
+/// Parse LLM response into array test cases for SIMD functions.
+/// Expects JSON array of {"inputs": [[...], [...]], "expected": [...]}
+fn parse_array_test_cases(response: &str) -> Result<Vec<crate::types::ArrayTestCase>> {
+    let json_str = extract_json(response);
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&json_str)
+        .context("Failed to parse SIMD test cases as JSON array")?;
+
+    let mut tests = Vec::new();
+    for item in &arr {
+        let inputs_arr = item["inputs"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("SIMD test case missing 'inputs' array"))?;
+        let expected_arr = item["expected"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("SIMD test case missing 'expected' array"))?;
+
+        let inputs: Vec<crate::types::ArrayValue> = inputs_arr
+            .iter()
+            .map(|arr| {
+                let vals: Vec<f32> = arr
+                    .as_array()
+                    .unwrap_or(&Vec::new())
+                    .iter()
+                    .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                    .collect();
+                crate::types::ArrayValue::F32Array(vals)
+            })
+            .collect();
+
+        let expected_vals: Vec<f32> = expected_arr
+            .iter()
+            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+            .collect();
+
+        tests.push(crate::types::ArrayTestCase {
+            id: None,
+            inputs,
+            expected: crate::types::ArrayValue::F32Array(expected_vals),
+        });
+    }
+    Ok(tests)
 }
 
 #[cfg(test)]
