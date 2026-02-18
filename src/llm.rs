@@ -43,7 +43,10 @@ impl LlmClient {
     /// Default: http://localhost:11434/v1/chat/completions
     pub fn new(base_url: &str, model: &str) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .expect("Failed to build HTTP client"),
             base_url: base_url.to_string(),
             model: model.to_string(),
         }

@@ -14,7 +14,7 @@ use types::Value;
 
 const DB_PATH: &str = "qt45.db";
 const OLLAMA_URL: &str = "http://localhost:11434/v1/chat/completions";
-const OLLAMA_MODEL: &str = "qwen2.5-coder:7b";
+const DEFAULT_MODEL: &str = "qwen2.5-coder:7b";
 
 /// The core loop: given a function request, retrieve from cache or generate via LLM,
 /// then compile and execute.
@@ -166,10 +166,32 @@ fn format_results(results: &[Value]) -> String {
         .join(", ")
 }
 
+fn parse_model_arg() -> String {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--model" {
+            if let Some(val) = args.get(i + 1) {
+                return val.clone();
+            }
+            eprintln!("error: --model requires a value");
+            std::process::exit(1);
+        }
+        if let Some(val) = args[i].strip_prefix("--model=") {
+            return val.to_string();
+        }
+        i += 1;
+    }
+    DEFAULT_MODEL.to_string()
+}
+
 fn main() -> Result<()> {
+    let model = parse_model_arg();
+    println!("[config] model: {model}");
+
     let store = FunctionStore::new(DB_PATH)?;
     let runtime = WasmRuntime::new()?;
-    let llm = LlmClient::new(OLLAMA_URL, OLLAMA_MODEL);
+    let llm = LlmClient::new(OLLAMA_URL, &model);
     let mut search = HybridSearch::new(&store)?;
 
     // --- i32 tests ---
