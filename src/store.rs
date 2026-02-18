@@ -148,7 +148,6 @@ impl FunctionStore {
     }
 
     /// Get all test cases for a function.
-    #[allow(dead_code)]
     pub fn get_tests(&self, function_name: &str) -> Result<Vec<TestCase>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, input_json, expected_json FROM function_tests WHERE function_name = ?1",
@@ -219,6 +218,26 @@ impl FunctionStore {
             "INSERT INTO vec_functions(function_id, embedding) VALUES (?1, ?2)",
             params![function_id, embedding.as_bytes()],
         )?;
+        Ok(())
+    }
+
+    /// Delete a function by name, including its test cases and embedding.
+    pub fn delete(&self, name: &str) -> Result<()> {
+        let id = self.get_id(name)?;
+        self.conn.execute(
+            "DELETE FROM function_tests WHERE function_name = ?1",
+            params![name],
+        )?;
+        self.conn.execute(
+            "DELETE FROM functions WHERE name = ?1",
+            params![name],
+        )?;
+        if let Some(id) = id {
+            self.conn.execute(
+                "DELETE FROM vec_functions WHERE function_id = ?1",
+                params![id],
+            )?;
+        }
         Ok(())
     }
 

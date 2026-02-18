@@ -57,9 +57,11 @@ Make sure Ollama is running, then:
 cargo run
 ```
 
-First run generates functions via the LLM, verifies them with auto-generated tests, and caches everything in qt45.db. To reset, delete qt45.db.
+This starts an interactive REPL. Request functions by providing a name, description, signature, and arguments:
 
 ```
+qt45> add "adds two integers" (i32, i32) -> i32 : 10, 20
+
 Request: add (adds two integers) args: [I32(10), I32(20)]
   [cache] miss — generating via LLM...
   [llm] attempt 1/3...
@@ -69,52 +71,54 @@ Request: add (adds two integers) args: [I32(10), I32(20)]
   [test] 3/3 passed — verified
   [wasm] 30
 
+qt45> add "adds two integers" (i32, i32) -> i32 : 100, 200
+
 Request: add (adds two integers) args: [I32(100), I32(200)]
   [cache] found 'add' (calls: 1, verified)
   [wasm] 300
 
-Request: multiply (multiplies two integers) args: [I32(5), I32(5)]
-  [cache] miss — generating via LLM...
-  [llm] attempt 1/3...
-  [llm] compilation successful
-  [store] saved function: 'multiply'
-  [test] generating test cases...
-  [test] 3/3 passed — verified
-  [wasm] 25
-
-Request: negate (returns the negation of an integer) args: [I32(42)]
-  [cache] miss — generating via LLM...
-  [llm] attempt 1/3...
-  [llm] compilation successful
-  [store] saved function: 'negate'
-  [test] generating test cases...
-  [test] 3/3 passed — verified
-  [wasm] -42
-
-Request: circle_area (returns the area of a circle given its radius (pi * r * r)) args: [F64(5.0)]
-  [cache] miss — generating via LLM...
-  [llm] attempt 1/3...
-  [llm] compilation successful
-  [store] saved function: 'circle_area'
-  [test] generating test cases...
-  [test] 3/3 passed — verified
-  [wasm] 78.53981633974483
+qt45> sum "adds two numbers together" (i32, i32) -> i32 : 7, 8
 
 Request: sum (adds two numbers together) args: [I32(7), I32(8)]
   [search] matched 'add' via both (score: 0.0328)
   [wasm] 15
 
---- Function Library ---
-  add            (i32, i32) -> i32    [calls: 3, verified: true]
-  answer         () -> i32            [calls: 1, verified: true]
-  circle_area    (f64) -> f64         [calls: 1, verified: true]
-  max            (i32, i32) -> i32    [calls: 1, verified: true]
-  multiply       (i32, i32) -> i32    [calls: 1, verified: true]
-  negate         (i32) -> i32         [calls: 1, verified: true]
-  subtract       (i32, i32) -> i32    [calls: 1, verified: true]
+qt45> .list
+NAME             SIGNATURE                 CALLS  VERIFIED
+------------------------------------------------------------
+add              (i32, i32) -> i32             3  yes
+
+qt45> .source add
+(module
+  (func (export "add") (param i32 i32) (result i32)
+    local.get 0
+    local.get 1
+    i32.add))
 ```
 
-Key behaviors:
+Use `--model` to select a different Ollama model, or `--demo` to run the built-in test sequence:
+
+```bash
+cargo run -- --model qwen2.5-coder:7b
+cargo run -- --demo
+```
+
+All state (functions, tests, embeddings) persists in `qt45.db`. To reset, delete `qt45.db`.
+
+### REPL Commands
+
+| Command | Description |
+|---------|-------------|
+| `.list` | List all stored functions |
+| `.info <name>` | Show function details |
+| `.source <name>` | Print WAT source code |
+| `.tests <name>` | Show test cases |
+| `.delete <name>` | Delete a function |
+| `.help` | Show commands and syntax |
+| `.quit` | Exit |
+
+### Key Behaviors
+
 - **Generate**: new functions are synthesized as WAT, compiled to WASM, and verified with LLM-generated test cases
 - **Cache**: subsequent calls to the same function load the compiled binary instantly
 - **Search**: requesting "sum" finds the existing "add" function via hybrid FTS5 + vector similarity search, avoiding redundant LLM generation
