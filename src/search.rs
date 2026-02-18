@@ -29,7 +29,10 @@ impl HybridSearch {
     /// Initialize the search system. Downloads the embedding model on first run (~50MB).
     pub fn new(store: &FunctionStore) -> Result<Self> {
         println!("[search] initializing embedding model...");
-        let cache_dir = std::path::PathBuf::from("cache");
+        let cache_dir = std::env::current_dir()?.join("cache");
+        // Override HF_HOME so fastembed/hf-hub won't ignore our cache_dir
+        // Safety: called at init before any threads are spawned
+        unsafe { std::env::set_var("HF_HOME", &cache_dir) };
         let model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::BGESmallENV15)
                 .with_cache_dir(cache_dir)

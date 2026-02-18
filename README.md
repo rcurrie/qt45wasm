@@ -51,17 +51,13 @@ cargo build
 
 ## Run
 
-Make sure Ollama is running, then:
+Make sure Ollama is running, then try the built-in demo. The first run synthesizes functions via the LLM, verifies each with auto-generated tests, and stores everything in `qt45.db`:
 
 ```bash
-cargo run
+cargo run -- --demo
 ```
 
-This starts an interactive REPL. Request functions by providing a name, description, signature, and arguments:
-
 ```
-qt45> add "adds two integers" (i32, i32) -> i32 : 10, 20
-
 Request: add (adds two integers) args: [I32(10), I32(20)]
   [cache] miss — generating via LLM...
   [llm] attempt 1/3...
@@ -71,22 +67,59 @@ Request: add (adds two integers) args: [I32(10), I32(20)]
   [test] 3/3 passed — verified
   [wasm] 30
 
-qt45> add "adds two integers" (i32, i32) -> i32 : 100, 200
-
-Request: add (adds two integers) args: [I32(100), I32(200)]
-  [cache] found 'add' (calls: 1, verified)
-  [wasm] 300
-
-qt45> sum "adds two numbers together" (i32, i32) -> i32 : 7, 8
+Request: multiply (multiplies two integers) args: [I32(5), I32(5)]
+  [cache] miss — generating via LLM...
+  ...
+  [wasm] 25
 
 Request: sum (adds two numbers together) args: [I32(7), I32(8)]
   [search] matched 'add' via both (score: 0.0328)
   [wasm] 15
 
+--- Function Library ---
+  add            (i32, i32) -> i32    [calls: 3, verified: true]
+  circle_area    (f64) -> f64         [calls: 1, verified: true]
+  max            (i32, i32) -> i32    [calls: 1, verified: true]
+  multiply       (i32, i32) -> i32    [calls: 1, verified: true]
+  negate         (i32) -> i32         [calls: 1, verified: true]
+  subtract       (i32, i32) -> i32    [calls: 1, verified: true]
+```
+
+Run it again — every function is now served from cache with zero LLM calls:
+
+```bash
+cargo run -- --demo
+```
+
+```
+Request: add (adds two integers) args: [I32(10), I32(20)]
+  [cache] found 'add' (calls: 3, verified)
+  [wasm] 30
+...
+```
+
+### Interactive REPL
+
+For interactive use, run without `--demo`:
+
+```bash
+cargo run
+```
+
+```
+qt45> add "adds two integers" (i32, i32) -> i32 : 10, 20
+
+Request: add (adds two integers) args: [I32(10), I32(20)]
+  [cache] found 'add' (calls: 9, verified)
+  [wasm] 30
+
 qt45> .list
 NAME             SIGNATURE                 CALLS  VERIFIED
 ------------------------------------------------------------
-add              (i32, i32) -> i32             3  yes
+add              (i32, i32) -> i32            10  yes
+circle_area      (f64) -> f64                  2  yes
+multiply         (i32, i32) -> i32             2  yes
+...
 
 qt45> .source add
 (module
@@ -95,17 +128,6 @@ qt45> .source add
     local.get 1
     i32.add))
 ```
-
-Use `--model` to select a different Ollama model, or `--demo` to run the built-in test sequence:
-
-```bash
-cargo run -- --model qwen2.5-coder:7b
-cargo run -- --demo
-```
-
-All state (functions, tests, embeddings) persists in `qt45.db`. To reset, delete `qt45.db`.
-
-### REPL Commands
 
 | Command | Description |
 |---------|-------------|
@@ -116,6 +138,21 @@ All state (functions, tests, embeddings) persists in `qt45.db`. To reset, delete
 | `.delete <name>` | Delete a function |
 | `.help` | Show commands and syntax |
 | `.quit` | Exit |
+
+Use `--model` to select a different Ollama model:
+
+```bash
+cargo run -- --model qwen2.5-coder:7b
+```
+
+### Storage
+
+All state persists locally in the project directory:
+
+- `qt45.db` — functions, tests, and vector embeddings (SQLite)
+- `cache/` — the [BGE-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) ONNX embedding model (~50MB, downloaded on first run)
+
+To reset, delete `qt45.db`. To re-download the embedding model, delete `cache/`.
 
 ### Key Behaviors
 
