@@ -1,7 +1,5 @@
 use anyhow::Result;
-use rusqlite::ffi::sqlite3_auto_extension;
 use rusqlite::{params, Connection};
-use zerocopy::IntoBytes;
 
 use crate::types::{ComputeTier, StoredFunction, TestCase, Value};
 
@@ -12,13 +10,6 @@ pub struct FunctionStore {
 
 impl FunctionStore {
     pub fn new(path: &str) -> Result<Self> {
-        // Register sqlite-vec extension before opening the connection
-        unsafe {
-            sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
-
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS functions (
@@ -32,7 +23,9 @@ impl FunctionStore {
                 created_at TEXT DEFAULT (datetime('now')),
                 last_used_at TEXT,
                 call_count INTEGER DEFAULT 0,
-                is_verified INTEGER DEFAULT 0
+                is_verified INTEGER DEFAULT 0,
+                compute_tier TEXT NOT NULL DEFAULT 'scalar',
+                shader_source TEXT
             );
             CREATE TABLE IF NOT EXISTS function_tests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,37 +54,10 @@ impl FunctionStore {
                 VALUES ('delete', old.id, old.name, old.description);
                 INSERT INTO functions_fts(rowid, name, description)
                 VALUES (new.id, new.name, new.description);
-            END;
-
-            -- Vector embeddings for semantic search (384-dim BGE-small-en-v1.5)
-            CREATE VIRTUAL TABLE IF NOT EXISTS vec_functions USING vec0(
-                function_id INTEGER PRIMARY KEY,
-                embedding float[384] distance_metric=cosine
-            );",
-        )?;
-
-        // Migration: add compute_tier and shader_source columns if they don't exist
-        Self::migrate_add_column(&conn, "functions", "compute_tier", "TEXT NOT NULL DEFAULT 'scalar'")?;
-        Self::migrate_add_column(&conn, "functions", "shader_source", "TEXT")?;
-
-        // Backfill FTS5 for any pre-existing functions (idempotent)
-        conn.execute_batch(
-            "INSERT OR IGNORE INTO functions_fts(rowid, name, description)
-             SELECT id, name, description FROM functions;",
+            END;",
         )?;
 
         Ok(Self { conn })
-    }
-
-    /// Safely add a column if it doesn't already exist.
-    fn migrate_add_column(conn: &Connection, table: &str, column: &str, col_type: &str) -> Result<()> {
-        let has_column: bool = conn
-            .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
-            .is_ok();
-        if !has_column {
-            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {col_type};"))?;
-        }
-        Ok(())
     }
 
     /// Look up a function by name.
@@ -232,33 +198,8 @@ impl FunctionStore {
         &self.conn
     }
 
-    /// Get the id of a function by name.
-    pub fn get_id(&self, name: &str) -> Result<Option<i64>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM functions WHERE name = ?1")?;
-        let mut rows = stmt.query(params![name])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(row.get(0)?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Insert or replace a vector embedding for a function.
-    pub fn upsert_embedding(&self, function_id: i64, embedding: &[f32]) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM vec_functions WHERE function_id = ?1",
-            params![function_id],
-        )?;
-        self.conn.execute(
-            "INSERT INTO vec_functions(function_id, embedding) VALUES (?1, ?2)",
-            params![function_id, embedding.as_bytes()],
-        )?;
-        Ok(())
-    }
-
-    /// Delete a function by name, including its test cases and embedding.
+    /// Delete a function by name, including its test cases.
     pub fn delete(&self, name: &str) -> Result<()> {
-        let id = self.get_id(name)?;
         self.conn.execute(
             "DELETE FROM function_tests WHERE function_name = ?1",
             params![name],
@@ -267,12 +208,6 @@ impl FunctionStore {
             "DELETE FROM functions WHERE name = ?1",
             params![name],
         )?;
-        if let Some(id) = id {
-            self.conn.execute(
-                "DELETE FROM vec_functions WHERE function_id = ?1",
-                params![id],
-            )?;
-        }
         Ok(())
     }
 

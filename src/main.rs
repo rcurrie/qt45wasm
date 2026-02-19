@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use gpu::GpuContext;
 use llm::LlmClient;
 use runtime::WasmRuntime;
-use search::HybridSearch;
+use search::FunctionSearch;
 use store::FunctionStore;
 use types::{ArrayValue, ComputeTier, Value};
 
@@ -28,7 +28,7 @@ fn synthesize(
     store: &FunctionStore,
     runtime: &WasmRuntime,
     llm: &LlmClient,
-    search: &mut HybridSearch,
+    search: &FunctionSearch,
     name: &str,
     description: &str,
     signature: &str,
@@ -86,11 +86,6 @@ fn synthesize(
     // 3. Store for future reuse
     store.save(name, description, signature, "wat", &wat, &bytes)?;
 
-    // 3b. Generate embedding for the new function
-    if let Err(e) = search.embed_function(store, name, description) {
-        println!("  [search] warning: failed to embed function: {e}");
-    }
-
     // 4. Generate and run tests
     verify_function(store, runtime, llm, name, description, signature, &module);
 
@@ -106,7 +101,6 @@ fn synthesize_array(
     store: &FunctionStore,
     runtime: &WasmRuntime,
     llm: &LlmClient,
-    search: &mut HybridSearch,
     name: &str,
     description: &str,
     inputs: &[ArrayValue],
@@ -146,13 +140,10 @@ fn synthesize_array(
     // 3. Store
     store.save_with_tier(name, description, "simd", "wat", &wat, &bytes, ComputeTier::Simd, None)?;
 
-    // 3b. Embed
-    if let Err(e) = search.embed_function(store, name, description) {
-        println!("  [search] warning: failed to embed function: {e}");
-    }
-
     // 4. Verify with LLM-generated array tests
-    verify_array_function(store, runtime, llm, name, description, &module, inputs.len());
+    verify_array_function(store, llm, name, description, inputs.len(), |test_inputs, count| {
+        runtime.call_array(&module, name, test_inputs, count)
+    });
 
     // 5. Execute
     let result = runtime.call_array(&module, name, inputs, result_count)?;
@@ -182,24 +173,22 @@ fn build_memory_layout(inputs: &[ArrayValue]) -> String {
 }
 
 /// Verify an array function using LLM-generated test cases.
+/// The `runner` closure executes a test case and returns the result.
 fn verify_array_function(
     store: &FunctionStore,
-    runtime: &WasmRuntime,
     llm: &LlmClient,
     name: &str,
     description: &str,
-    module: &wasmtime::Module,
     expected_input_count: usize,
+    runner: impl Fn(&[ArrayValue], usize) -> Result<ArrayValue>,
 ) {
-    println!("  [test] generating simd test cases...");
-    let all_cases = llm.generate_simd_tests(name, description);
-    // Filter to test cases with the correct number of inputs
-    let test_cases: Vec<_> = all_cases
+    println!("  [test] generating test cases...");
+    let test_cases: Vec<_> = llm.generate_simd_tests(name, description)
         .into_iter()
         .filter(|tc| tc.inputs.len() == expected_input_count)
         .collect();
     if test_cases.is_empty() {
-        println!("  [test] no simd test cases generated");
+        println!("  [test] no test cases generated");
         return;
     }
 
@@ -208,7 +197,7 @@ fn verify_array_function(
 
     for tc in &test_cases {
         let result_count = tc.expected.element_count();
-        match runtime.call_array(module, name, &tc.inputs, result_count) {
+        match runner(&tc.inputs, result_count) {
             Ok(actual) => {
                 if actual.approx_eq(&tc.expected) {
                     passed += 1;
@@ -235,7 +224,6 @@ fn synthesize_gpu(
     store: &FunctionStore,
     runtime: &WasmRuntime,
     llm: &LlmClient,
-    search: &mut HybridSearch,
     gpu: &Arc<Mutex<GpuContext>>,
     name: &str,
     description: &str,
@@ -279,13 +267,10 @@ fn synthesize_gpu(
     // 3. Store
     store.save_with_tier(name, description, "gpu", "wat", &wat, &bytes, ComputeTier::Gpu, wgsl.as_deref())?;
 
-    // 3b. Embed
-    if let Err(e) = search.embed_function(store, name, description) {
-        println!("  [search] warning: failed to embed function: {e}");
-    }
-
     // 4. Verify with LLM-generated tests (reuse SIMD tests — same array format)
-    verify_gpu_function(store, runtime, llm, gpu, name, description, &module, inputs.len());
+    verify_array_function(store, llm, name, description, inputs.len(), |test_inputs, count| {
+        runtime.call_gpu(&module, name, gpu, test_inputs, count)
+    });
 
     // 5. Execute
     let result = runtime.call_gpu(&module, name, gpu, inputs, result_count)?;
@@ -307,58 +292,7 @@ fn extract_wgsl_from_wat(wat: &str) -> Option<String> {
     Some(escaped.replace("\\0a", "\n"))
 }
 
-/// Verify a GPU function using LLM-generated test cases.
-fn verify_gpu_function(
-    store: &FunctionStore,
-    runtime: &WasmRuntime,
-    llm: &LlmClient,
-    gpu: &Arc<Mutex<GpuContext>>,
-    name: &str,
-    description: &str,
-    module: &wasmtime::Module,
-    expected_input_count: usize,
-) {
-    println!("  [test] generating gpu test cases...");
-    let all_cases = llm.generate_simd_tests(name, description);
-    // Filter to test cases with the correct number of inputs
-    let test_cases: Vec<_> = all_cases
-        .into_iter()
-        .filter(|tc| tc.inputs.len() == expected_input_count)
-        .collect();
-    if test_cases.is_empty() {
-        println!("  [test] no gpu test cases generated");
-        return;
-    }
-
-    let mut passed = 0;
-    let total = test_cases.len();
-
-    for tc in &test_cases {
-        let result_count = tc.expected.element_count();
-        match runtime.call_gpu(module, name, gpu, &tc.inputs, result_count) {
-            Ok(actual) => {
-                if actual.approx_eq(&tc.expected) {
-                    passed += 1;
-                } else {
-                    println!("  [test] FAIL: {name}(...) = {actual} (expected {})", tc.expected);
-                }
-            }
-            Err(e) => {
-                println!("  [test] ERROR: {name}(...) — {e}");
-            }
-        }
-    }
-
-    if passed == total {
-        let _ = store.set_verified(name, true);
-        println!("  [test] {passed}/{total} passed — verified");
-    } else {
-        println!("  [test] {passed}/{total} passed");
-    }
-}
-
 /// Generate test cases via LLM, run them, and mark the function as verified if all pass.
-/// Non-fatal: prints results but doesn't propagate errors.
 fn verify_function(
     store: &FunctionStore,
     runtime: &WasmRuntime,
@@ -816,7 +750,7 @@ fn run_repl(
     store: &FunctionStore,
     runtime: &WasmRuntime,
     llm: &LlmClient,
-    search: &mut HybridSearch,
+    search: &FunctionSearch,
 ) -> Result<()> {
     println!("qt45 — type .help for commands, .quit to exit\n");
 
@@ -851,7 +785,7 @@ fn run_repl(
             // SIMD array call
             match parse_array_call(&trimmed[5..]) {
                 Ok((name, description, arrays)) => {
-                    match synthesize_array(store, runtime, llm, search, &name, &description, &arrays) {
+                    match synthesize_array(store, runtime, llm, &name, &description, &arrays) {
                         Ok(_) => {}
                         Err(e) => eprintln!("Error: {e:#}"),
                     }
@@ -880,7 +814,7 @@ fn run_repl(
 
             match parse_array_call(&trimmed[4..]) {
                 Ok((name, description, arrays)) => {
-                    match synthesize_gpu(store, runtime, llm, search, gpu, &name, &description, &arrays) {
+                    match synthesize_gpu(store, runtime, llm, gpu, &name, &description, &arrays) {
                         Ok(_) => {}
                         Err(e) => eprintln!("Error: {e:#}"),
                     }
@@ -916,7 +850,7 @@ fn run_demo(
     store: &FunctionStore,
     runtime: &WasmRuntime,
     llm: &LlmClient,
-    search: &mut HybridSearch,
+    search: &FunctionSearch,
 ) -> Result<()> {
     synthesize(
         store, runtime, llm, search,
@@ -975,7 +909,7 @@ fn run_demo(
     // --- SIMD demo ---
     println!("\n=== SIMD Demo ===");
     synthesize_array(
-        store, runtime, llm, search,
+        store, runtime, llm,
         "vec_add_f32", "element-wise addition of two f32 arrays",
         &[
             ArrayValue::F32Array(vec![1.0, 2.0, 3.0, 4.0]),
@@ -984,7 +918,7 @@ fn run_demo(
     )?;
 
     synthesize_array(
-        store, runtime, llm, search,
+        store, runtime, llm,
         "vec_add_f32", "element-wise addition of two f32 arrays",
         &[
             ArrayValue::F32Array(vec![100.0, 200.0, 300.0, 400.0]),
@@ -1014,13 +948,13 @@ fn run_demo(
     };
 
     synthesize_gpu(
-        store, runtime, llm, search, &gpu,
+        store, runtime, llm, &gpu,
         "gpu_double_f32", "double all elements of an f32 array",
         &[ArrayValue::F32Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
     )?;
 
     synthesize_gpu(
-        store, runtime, llm, search, &gpu,
+        store, runtime, llm, &gpu,
         "gpu_double_f32", "double all elements of an f32 array",
         &[ArrayValue::F32Array(vec![10.0, 20.0, 30.0, 40.0])],
     )?;
@@ -1045,12 +979,12 @@ fn main() -> Result<()> {
     let store = FunctionStore::new(DB_PATH)?;
     let runtime = WasmRuntime::new()?;
     let llm = LlmClient::new(OLLAMA_URL, &cli.model);
-    let mut search = HybridSearch::new(&store)?;
+    let search = FunctionSearch::new();
 
     if cli.demo {
-        run_demo(&store, &runtime, &llm, &mut search)
+        run_demo(&store, &runtime, &llm, &search)
     } else {
-        run_repl(&store, &runtime, &llm, &mut search)
+        run_repl(&store, &runtime, &llm, &search)
     }
 }
 

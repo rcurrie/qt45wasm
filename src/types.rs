@@ -70,7 +70,6 @@ impl ArrayValue {
 
     /// Serialize to little-endian bytes, padded to 16-byte boundary.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let raw = self.raw_byte_len();
         let padded = self.byte_len();
         let mut bytes = Vec::with_capacity(padded);
         match self {
@@ -90,10 +89,7 @@ impl ArrayValue {
                 }
             }
         }
-        // Pad to 16-byte boundary with zeros
         bytes.resize(padded, 0);
-        debug_assert_eq!(bytes.len(), padded);
-        let _ = raw; // suppress unused warning in release
         bytes
     }
 
@@ -270,7 +266,7 @@ pub struct ArrayTestCase {
 
 /// A stored function record from the database
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StoredFunction {
     pub id: i64,
     pub name: String,
