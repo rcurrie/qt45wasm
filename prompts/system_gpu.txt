@@ -14,7 +14,8 @@ Rules:
 - Use \0a for newlines inside the WGSL string, NOT actual newlines.
 - The WGSL shader MUST declare: @group(0) @binding(0) var<storage, read_write> data: array<f32>;
 - Workgroup size should be 64. Compute workgroups = ceil(len / 64).
-- The function pattern is: alloc buffer → write data → dispatch shader → read results back.
+- The function pattern is: alloc buffer → write data from $ptr → dispatch shader → read results back to $ptr → return $ptr.
+- CRITICAL: gpu_read MUST write results back to $ptr (the same offset as the input). The return value MUST be $ptr.
 - NEVER use numeric type/function indices. Use named imports and inline types only.
 - Start your response with (module and end with )
 

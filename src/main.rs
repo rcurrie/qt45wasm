@@ -152,7 +152,7 @@ fn synthesize_array(
     }
 
     // 4. Verify with LLM-generated array tests
-    verify_array_function(store, runtime, llm, name, description, &module);
+    verify_array_function(store, runtime, llm, name, description, &module, inputs.len());
 
     // 5. Execute
     let result = runtime.call_array(&module, name, inputs, result_count)?;
@@ -189,9 +189,15 @@ fn verify_array_function(
     name: &str,
     description: &str,
     module: &wasmtime::Module,
+    expected_input_count: usize,
 ) {
     println!("  [test] generating simd test cases...");
-    let test_cases = llm.generate_simd_tests(name, description);
+    let all_cases = llm.generate_simd_tests(name, description);
+    // Filter to test cases with the correct number of inputs
+    let test_cases: Vec<_> = all_cases
+        .into_iter()
+        .filter(|tc| tc.inputs.len() == expected_input_count)
+        .collect();
     if test_cases.is_empty() {
         println!("  [test] no simd test cases generated");
         return;
@@ -279,7 +285,7 @@ fn synthesize_gpu(
     }
 
     // 4. Verify with LLM-generated tests (reuse SIMD tests — same array format)
-    verify_gpu_function(store, runtime, llm, gpu, name, description, &module);
+    verify_gpu_function(store, runtime, llm, gpu, name, description, &module, inputs.len());
 
     // 5. Execute
     let result = runtime.call_gpu(&module, name, gpu, inputs, result_count)?;
@@ -310,9 +316,15 @@ fn verify_gpu_function(
     name: &str,
     description: &str,
     module: &wasmtime::Module,
+    expected_input_count: usize,
 ) {
     println!("  [test] generating gpu test cases...");
-    let test_cases = llm.generate_simd_tests(name, description);
+    let all_cases = llm.generate_simd_tests(name, description);
+    // Filter to test cases with the correct number of inputs
+    let test_cases: Vec<_> = all_cases
+        .into_iter()
+        .filter(|tc| tc.inputs.len() == expected_input_count)
+        .collect();
     if test_cases.is_empty() {
         println!("  [test] no gpu test cases generated");
         return;

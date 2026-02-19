@@ -170,10 +170,13 @@ impl WasmRuntime {
                 let wgsl_bytes = &memory.data(&caller)
                     [shader_ptr as usize..(shader_ptr as usize + shader_len as usize)];
                 let wgsl = std::str::from_utf8(wgsl_bytes).unwrap();
-                let _ = gpu_dispatch
+                if let Err(e) = gpu_dispatch
                     .lock()
                     .unwrap()
-                    .dispatch_shader(wgsl, buf_handle, workgroups as u32);
+                    .dispatch_shader(wgsl, buf_handle, workgroups as u32)
+                {
+                    eprintln!("  [gpu] dispatch_shader error: {e}");
+                }
             },
         )?;
 
@@ -238,9 +241,7 @@ impl WasmRuntime {
         if result_ptr + result_byte_len > mem_data.len() {
             anyhow::bail!(
                 "Result at offset {} with size {} exceeds memory bounds {}",
-                result_ptr,
-                result_byte_len,
-                mem_data.len()
+                result_ptr, result_byte_len, mem_data.len()
             );
         }
         let result_bytes = &mem_data[result_ptr..result_ptr + result_byte_len];
@@ -396,5 +397,91 @@ mod tests {
             }
             _ => panic!("Expected F32Array result"),
         }
+    }
+
+    /// Stress test: run the same GPU WAT module 50 times with different inputs.
+    /// Each call creates a fresh Store/Instance but reuses the same GpuContext.
+    /// This isolates whether the runtime + GPU pipeline is reliable
+    /// independent of any LLM code generation.
+    #[test]
+    fn test_gpu_stress_repeated_calls() {
+        use crate::gpu::GpuContext;
+        use std::sync::{Arc, Mutex};
+
+        let runtime = WasmRuntime::new().unwrap();
+        let gpu = Arc::new(Mutex::new(GpuContext::new().expect("GPU should be available")));
+
+        // Exact WAT from the prompt example — known good
+        let wat = r#"
+(module
+  (import "gpu" "alloc" (func $gpu_alloc (param i32) (result i32)))
+  (import "gpu" "write_buffer" (func $gpu_write (param i32 i32 i32)))
+  (import "gpu" "dispatch_shader" (func $gpu_dispatch (param i32 i32 i32 i32)))
+  (import "gpu" "read_buffer" (func $gpu_read (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 4096)
+    "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\0a@compute @workgroup_size(64)\0afn main(@builtin(global_invocation_id) id: vec3<u32>) {\0a  if id.x < arrayLength(&data) {\0a    data[id.x] = data[id.x] * 2.0;\0a  }\0a}\0a")
+  (func (export "gpu_double_f32") (param $ptr i32) (param $len i32) (result i32)
+    (local $byte_len i32)
+    (local $buf i32)
+    (local $wg i32)
+    (local.set $byte_len (i32.mul (local.get $len) (i32.const 4)))
+    (local.set $buf (call $gpu_alloc (local.get $byte_len)))
+    (call $gpu_write (local.get $buf) (local.get $ptr) (local.get $byte_len))
+    (local.set $wg (i32.div_u (i32.add (local.get $len) (i32.const 63)) (i32.const 64)))
+    (call $gpu_dispatch (i32.const 4096) (i32.const 224) (local.get $buf) (local.get $wg))
+    (call $gpu_read (local.get $buf) (local.get $ptr) (local.get $byte_len))
+    (local.get $ptr)))
+"#;
+
+        let (module, _) = runtime.compile_wat(wat).expect("GPU WAT should compile");
+
+        let test_cases: Vec<(Vec<f32>, Vec<f32>)> = vec![
+            // 4-element cases
+            (vec![1.0, 2.0, 3.0, 4.0], vec![2.0, 4.0, 6.0, 8.0]),
+            (vec![-1.0, -2.0, -3.0, -4.0], vec![-2.0, -4.0, -6.0, -8.0]),
+            (vec![0.0, 0.0, 0.0, 0.0], vec![0.0, 0.0, 0.0, 0.0]),
+            (vec![1.5, 2.5, 3.5, 4.5], vec![3.0, 5.0, 7.0, 9.0]),
+            (vec![100.0, 200.0, 300.0, 400.0], vec![200.0, 400.0, 600.0, 800.0]),
+            (vec![0.001, 0.002, 0.003, 0.004], vec![0.002, 0.004, 0.006, 0.008]),
+            // 8-element cases
+            (vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+             vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]),
+            (vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
+             vec![20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0]),
+            // 16-element case
+            (vec![1.0; 16], vec![2.0; 16]),
+            // 64-element case (exactly 1 workgroup)
+            ((0..64).map(|i| i as f32).collect(),
+             (0..64).map(|i| (i * 2) as f32).collect()),
+        ];
+
+        let mut failures = 0;
+        let iterations = 100;
+
+        for round in 0..iterations {
+            let (input, expected) = &test_cases[round % test_cases.len()];
+            let arr = ArrayValue::F32Array(input.clone());
+            let result = runtime
+                .call_gpu(&module, "gpu_double_f32", &gpu, &[arr], input.len())
+                .unwrap_or_else(|e| panic!("Round {round}: call_gpu failed: {e}"));
+
+            match &result {
+                ArrayValue::F32Array(v) => {
+                    if v != expected {
+                        failures += 1;
+                        eprintln!(
+                            "Round {round} FAIL: input={:?} got={:?} expected={:?}",
+                            &input[..input.len().min(8)],
+                            &v[..v.len().min(8)],
+                            &expected[..expected.len().min(8)]
+                        );
+                    }
+                }
+                _ => panic!("Round {round}: expected F32Array"),
+            }
+        }
+
+        assert_eq!(failures, 0, "{failures}/{iterations} rounds failed — GPU runtime is unreliable");
     }
 }
