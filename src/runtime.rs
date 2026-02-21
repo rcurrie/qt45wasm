@@ -17,6 +17,10 @@ impl WasmRuntime {
         Ok(Self { engine })
     }
 
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
     /// Compile WAT source text into a WASM module.
     /// Returns the module and its serialized bytes for caching.
     pub fn compile_wat(&self, wat: &str) -> Result<(Module, Vec<u8>)> {

@@ -13,3 +13,7 @@ wasmtime = "41.0"
 strsim = "0.11"
 wgpu = "28"
 pollster = "0.4"
+
+[[bin]]
+name = "eval_models"
+path = "src/bin/eval_models.rs"

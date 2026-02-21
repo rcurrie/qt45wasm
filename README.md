@@ -65,6 +65,16 @@ Each tier has its own code path — scalar functions are never touched when runn
     └─────────────────────────────────────────┘
 ```
 
+### Model Evaluation
+
+We benchmarked five local small quantized ollama models on WAT code generation across all three tiers. TL;DR; CPU and SIMD generation - good, GPU: Going to need a bigger model or one tuned with WAT a bit more.
+
+See [FINDINGS.md](FINDINGS.md) for full results. Run the benchmark yourself with:
+
+```bash
+cargo run --bin eval_models
+```
+
 ## Install
 
 Requires [Rust](https://rustup.rs/) and [Ollama](https://ollama.com/). GPU tier requires a Metal-capable Mac (Apple Silicon or discrete AMD GPU); SIMD and scalar work on any platform.
@@ -74,8 +84,8 @@ Requires [Rust](https://rustup.rs/) and [Ollama](https://ollama.com/). GPU tier 
 ollama pull qwen2.5-coder:7b
 
 # Clone and build
-git clone https://github.com/rcurrie/qt45.git qt45
-cd qt45
+git clone https://github.com/rcurrie/qt45wasm.git qt45
+cd qt45wasm
 cargo build
 ```
 
@@ -163,7 +173,7 @@ cargo run
 #### Scalar functions
 
 ```
-qt45> add "adds two integers" (i32, i32) -> i32 : 10, 20
+qt45wasm> add "adds two integers" (i32, i32) -> i32 : 10, 20
 
 Request: add (adds two integers) args: [I32(10), I32(20)]
   [cache] found 'add' (calls: 9, verified)
@@ -175,7 +185,7 @@ Request: add (adds two integers) args: [I32(10), I32(20)]
 Prefix with `simd` and pass arrays in brackets:
 
 ```
-qt45> simd vec_add_f32 "element-wise add" [1,2,3,4] [5,6,7,8]
+qt45wasm> simd vec_add_f32 "element-wise add" [1,2,3,4] [5,6,7,8]
 
 Request [simd]: vec_add_f32 (element-wise add) inputs: 2
   [simd] [6, 8, 10, 12]
@@ -186,7 +196,7 @@ Request [simd]: vec_add_f32 (element-wise add) inputs: 2
 Prefix with `gpu` — the GPU context initializes lazily on first use:
 
 ```
-qt45> gpu gpu_double_f32 "double all elements" [1,2,3,4]
+qt45wasm> gpu gpu_double_f32 "double all elements" [1,2,3,4]
   [gpu] initializing GPU context...
   [gpu] adapter: Apple M1 Pro
 
@@ -197,21 +207,21 @@ Request [gpu]: gpu_double_f32 (double all elements) inputs: 1
 #### Commands
 
 ```
-qt45> .list
+qt45wasm> .list
 NAME             SIGNATURE                CALLS  TIER     VERIFIED
 --------------------------------------------------------------------
 add              (i32, i32) -> i32           10  scalar   yes
 vec_add_f32      simd                         2  simd     yes
 gpu_double_f32   gpu                          2  gpu      yes
 
-qt45> .source add
+qt45wasm> .source add
 (module
   (func (export "add") (param i32 i32) (result i32)
     local.get 0
     local.get 1
     i32.add))
 
-qt45> .shader gpu_double_f32
+qt45wasm> .shader gpu_double_f32
 @group(0) @binding(0) var<storage, read_write> data: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
